@@ -1,8 +1,10 @@
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
+mod hybrid;
 mod vector;
 
+pub use hybrid::{HybridHit, HybridSearchOptions, hybrid_search, reciprocal_rank_fusion};
 pub use vector::{VectorError, VectorIndex};
 
 pub type DocId = u32;
