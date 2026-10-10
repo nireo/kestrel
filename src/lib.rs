@@ -1,6 +1,10 @@
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
+mod vector;
+
+pub use vector::{VectorError, VectorIndex};
+
 pub type DocId = u32;
 
 /// One term's occurrences in one document. Exactly 8 bytes, without pointers.
@@ -156,23 +160,13 @@ impl InvertedIndex {
             }
         }
 
-        // Reverse makes the heap root the WORST retained hit. Keep only k hits,
-        // rather than sorting all matching documents. The score map is sparse:
-        // unmatched documents are neither scanned nor allocated an entry.
-        let mut best = BinaryHeap::with_capacity(limit.min(scores.len()));
-        for (doc_id, score) in scores {
-            let candidate = Reverse(RankedHit(SearchHit { doc_id, score }));
-            if best.len() < limit {
-                best.push(candidate);
-            } else if candidate < *best.peek().expect("nonempty heap: limit is positive") {
-                *best.peek_mut().expect("nonempty heap: limit is positive") = candidate;
-            }
-        }
-
-        best.into_sorted_vec()
-            .into_iter()
-            .map(|hit| hit.0.0)
-            .collect()
+        // The score map is sparse: unmatched documents have no entry.
+        top_k(
+            scores
+                .into_iter()
+                .map(|(doc_id, score)| SearchHit { doc_id, score }),
+            limit,
+        )
     }
 }
 
@@ -180,6 +174,28 @@ fn tokens(normalized: &str) -> impl Iterator<Item = &str> {
     normalized
         .split(|c: char| !c.is_alphanumeric())
         .filter(|term| !term.is_empty())
+}
+
+/// Shared by lexical and vector search. Reverse puts the worst retained hit at
+/// the root, so a better candidate can replace it without sorting every match.
+fn top_k(hits: impl IntoIterator<Item = SearchHit>, limit: usize) -> Vec<SearchHit> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let hits = hits.into_iter();
+    let mut best = BinaryHeap::with_capacity(limit.min(hits.size_hint().0));
+    for hit in hits {
+        let candidate = Reverse(RankedHit(hit));
+        if best.len() < limit {
+            best.push(candidate);
+        } else if candidate < *best.peek().expect("nonempty heap: limit is positive") {
+            *best.peek_mut().expect("nonempty heap: limit is positive") = candidate;
+        }
+    }
+    best.into_sorted_vec()
+        .into_iter()
+        .map(|hit| hit.0.0)
+        .collect()
 }
 
 /// Larger means better: higher score, then lower document ID.
