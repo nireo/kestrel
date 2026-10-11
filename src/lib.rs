@@ -1,12 +1,16 @@
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
+mod collection;
 mod embeddings;
 mod hybrid;
+mod snapshot;
 mod vector;
 
+pub use collection::{Collection, CollectionError};
 pub use embeddings::{EmbeddingConfig, EmbeddingError, TextEmbedder};
 pub use hybrid::{HybridHit, HybridSearchOptions, hybrid_search, reciprocal_rank_fusion};
+pub use snapshot::SnapshotError;
 pub use vector::{VectorError, VectorIndex};
 
 pub type DocId = u32;
@@ -179,6 +183,10 @@ fn tokens(normalized: &str) -> impl Iterator<Item = &str> {
         .split(|c: char| !c.is_alphanumeric())
         .filter(|term| !term.is_empty())
 }
+
+// Bump this when tokenization changes so snapshots cannot silently rebuild a
+// different lexical index. Independent of the snapshot's binary format version.
+const TOKENIZER_VERSION: u32 = 1;
 
 /// Shared by lexical and vector search. Reverse puts the worst retained hit at
 /// the root, so a better candidate can replace it without sorting every match.

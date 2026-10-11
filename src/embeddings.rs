@@ -16,7 +16,7 @@ pub struct EmbeddingConfig {
     pub query_instruction: &'static str,
 }
 
-const CONFIG: EmbeddingConfig = EmbeddingConfig {
+pub(crate) const CONFIG: EmbeddingConfig = EmbeddingConfig {
     model_id: "BAAI/bge-small-en-v1.5",
     artifact_repo: "Xenova/bge-small-en-v1.5",
     artifact_file: "onnx/model.onnx",

@@ -14,6 +14,8 @@ pub enum VectorError {
     ZeroVector,
     #[error("document {doc_id} already has a vector")]
     DuplicateDocument { doc_id: DocId },
+    #[error("stored vector must have unit length")]
+    NotNormalized,
 }
 
 /// Exact cosine-similarity search over fixed-size, unit-length vectors.
@@ -64,12 +66,20 @@ impl VectorIndex {
             return Err(VectorError::DuplicateDocument { doc_id });
         }
         let normalized = self.normalize(vector)?;
+        self.append_normalized(doc_id, &normalized);
+        Ok(())
+    }
+
+    /// Internal commit step. The caller must validate the vector and ensure
+    /// the document ID is unused before reaching this point.
+    pub(crate) fn append_normalized(&mut self, doc_id: DocId, normalized: &[f32]) {
+        debug_assert_eq!(normalized.len(), self.dimensions);
+        debug_assert!(!self.positions.contains_key(&doc_id));
         let row = self.len();
 
-        self.vectors.extend_from_slice(&normalized);
+        self.vectors.extend_from_slice(normalized);
         self.doc_ids.push(doc_id);
         self.positions.insert(doc_id, row);
-        Ok(())
     }
 
     /// Borrow the stored, normalized vector for a document.
@@ -109,7 +119,25 @@ impl VectorIndex {
         Ok(top_k(hits, limit))
     }
 
-    fn normalize(&self, vector: &[f32]) -> Result<Vec<f32>, VectorError> {
+    pub(crate) fn normalize(&self, vector: &[f32]) -> Result<Vec<f32>, VectorError> {
+        let length = self.vector_length(vector)?;
+        Ok(vector
+            .iter()
+            .map(|&component| (f64::from(component) / length) as f32)
+            .collect())
+    }
+
+    /// Check a stored vector without changing its float values during restore.
+    pub(crate) fn validate_normalized(&self, vector: &[f32]) -> Result<(), VectorError> {
+        let length = self.vector_length(vector)?;
+        // Allow rounding from f64 normalization back to stored f32 components.
+        if (length - 1.0).abs() > 1e-5 {
+            return Err(VectorError::NotNormalized);
+        }
+        Ok(())
+    }
+
+    fn vector_length(&self, vector: &[f32]) -> Result<f64, VectorError> {
         if vector.len() != self.dimensions {
             return Err(VectorError::DimensionMismatch {
                 expected: self.dimensions,
@@ -129,10 +157,6 @@ impl VectorIndex {
         if squared_length == 0.0 {
             return Err(VectorError::ZeroVector);
         }
-        let length = squared_length.sqrt();
-        Ok(vector
-            .iter()
-            .map(|&component| (f64::from(component) / length) as f32)
-            .collect())
+        Ok(squared_length.sqrt())
     }
 }
