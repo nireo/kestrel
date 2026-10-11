@@ -889,6 +889,7 @@ dependencies = [
  "fastembed",
  "postcard",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
 ]

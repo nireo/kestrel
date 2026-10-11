@@ -1,0 +1,137 @@
+{
+  "name": "Kestrel support and search tutorial",
+  "documents": [
+    {
+      "id": "password-recovery",
+      "text": "Password recovery: if you forget your password, select Forgot password on the sign-in page. Enter your email address and follow the recovery link to set a new password and regain access to your account."
+    },
+    {
+      "id": "two-factor-authentication",
+      "text": "Two-factor authentication protects your account even if someone steals your password. Enable an authenticator app in Security settings. Signing in then requires both your password and a temporary verification code. Keep your backup codes somewhere safe."
+    },
+    {
+      "id": "email-change",
+      "text": "To change your email address, open Account settings and enter the new address. Confirm the verification message sent to that inbox. Your password and existing subscription remain unchanged."
+    },
+    {
+      "id": "account-deletion",
+      "text": "Permanently delete your account from Privacy settings. Deletion removes your profile and personal information and cannot be undone after the grace period. Download any data you want to keep before confirming account deletion."
+    },
+    {
+      "id": "profile-appearance",
+      "text": "Appearance settings let you choose a dark or light theme, change the background color, and adjust font size. These preferences change how your workspace looks without changing its contents."
+    },
+    {
+      "id": "export-data",
+      "text": "Export your workspace data from Settings, then Data export. The downloadable archive contains your documents and profile information. Exporting creates a copy and does not delete your account or stop your subscription."
+    },
+    {
+      "id": "refund-policy",
+      "text": "Refund policy: annual subscriptions are eligible for a full refund within fourteen days of the initial payment. Contact billing support with the invoice number. Canceling a subscription alone does not submit a refund request."
+    },
+    {
+      "id": "cancel-subscription",
+      "text": "Cancel your subscription in Billing settings to stop the next renewal. Your paid features remain available until the current billing period ends. Cancellation does not delete your account and does not automatically refund earlier payments."
+    },
+    {
+      "id": "update-payment-card",
+      "text": "Replace an expired payment card in Billing, then Payment methods. Enter the new card details and mark it as the default for future subscription charges. Existing invoices keep their original payment details."
+    },
+    {
+      "id": "download-invoice",
+      "text": "To download an invoice or receipt, open Billing history, select the monthly payment, and choose Download PDF. The receipt includes the amount paid, payment date, and your billing details."
+    },
+    {
+      "id": "team-invitations",
+      "text": "Invite a coworker to your workspace from Team settings. Enter their email address and send an invitation. They can follow the invitation link to join your team and collaborate on shared documents."
+    },
+    {
+      "id": "team-roles",
+      "text": "Workspace roles control what team members can do. Owners manage billing and administrators manage members. Editors can change shared documents, while viewers have read-only access. Change a member's role from Team settings."
+    },
+    {
+      "id": "api-key-creation",
+      "text": "Create an API key in Developer settings to authenticate programmatic requests. Copy the secret when it is first displayed and store it securely. Revoke a compromised key and create a replacement; never place API secrets in public source code."
+    },
+    {
+      "id": "api-rate-limits",
+      "text": "An HTTP 429 response means your client exceeded the API rate limit. Wait for the Retry-After interval before sending another request. Use exponential backoff with jitter and reduce concurrent requests to avoid repeated throttling."
+    },
+    {
+      "id": "webhook-retries",
+      "text": "Webhooks notify your server when an event occurs. Failed deliveries are retried automatically. Verify the webhook signature and use the event ID to ignore duplicate deliveries. Return a successful HTTP response after accepting the event."
+    },
+    {
+      "id": "keyword-search",
+      "text": "Keyword search uses an inverted index to find documents containing query terms. BM25 ranks matches using term frequency, rarity, and document length. This is useful for exact identifiers, product names, and specific words."
+    },
+    {
+      "id": "semantic-search",
+      "text": "Semantic search embeds text into vectors and compares their directions using cosine similarity. It can retrieve paraphrases with similar meaning even when the query and document share few exact words."
+    },
+    {
+      "id": "hybrid-search",
+      "text": "Hybrid search combines BM25 keyword matches with semantic vector matches. Reciprocal rank fusion merges the two ranked candidate lists. Combining these methods helps queries that contain both exact identifiers and paraphrased descriptions."
+    },
+    {
+      "id": "save-snapshot",
+      "text": "Save a search collection to a snapshot file to preserve its document text, stable IDs, and embeddings. Saving writes and syncs a temporary file before replacing the previous snapshot. Changes made later require another explicit save."
+    },
+    {
+      "id": "restore-snapshot",
+      "text": "Load a collection snapshot after restarting the application to reopen the saved documents and vectors. Loading rebuilds the BM25 index from text and preserves document IDs. Document embeddings are restored without running embedding inference again."
+    }
+  ],
+  "queries": [
+    {
+      "id": "password-keywords",
+      "text": "password recovery link",
+      "relevant_document_ids": ["password-recovery"]
+    },
+    {
+      "id": "forgotten-credentials",
+      "text": "I've lost my login credentials. How do I get back in?",
+      "relevant_document_ids": ["password-recovery"]
+    },
+    {
+      "id": "stolen-password",
+      "text": "How can I stop someone signing in with a stolen password?",
+      "relevant_document_ids": ["two-factor-authentication"]
+    },
+    {
+      "id": "payment-receipt",
+      "text": "Where can I get a PDF receipt for last month's payment?",
+      "relevant_document_ids": ["download-invoice"]
+    },
+    {
+      "id": "annual-refund",
+      "text": "refund policy annual subscription",
+      "relevant_document_ids": ["refund-policy"]
+    },
+    {
+      "id": "invite-coworker",
+      "text": "How do I let a coworker join our workspace?",
+      "relevant_document_ids": ["team-invitations"]
+    },
+    {
+      "id": "throttled-client",
+      "text": "Requests keep failing with HTTP 429. What should my client do?",
+      "relevant_document_ids": ["api-rate-limits"]
+    },
+    {
+      "id": "retrieval-methods",
+      "text": "Which search methods help with exact identifiers and semantic paraphrases?",
+      "relevant_document_ids": ["keyword-search", "semantic-search", "hybrid-search"]
+    },
+    {
+      "id": "collection-restart",
+      "text": "How can I save my search collection and reopen it after restarting?",
+      "relevant_document_ids": ["save-snapshot", "restore-snapshot"]
+    },
+    {
+      "id": "erase-account",
+      "text": "I want to permanently erase my account and its personal information.",
+      "relevant_document_ids": ["account-deletion"]
+    }
+  ]
+}
