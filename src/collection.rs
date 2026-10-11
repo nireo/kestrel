@@ -1,14 +1,39 @@
+use std::ops::Range;
 use std::path::Path;
 
+use crate::chunking::Chunker;
 use crate::{
-    DocId, EmbeddingConfig, EmbeddingError, HybridHit, HybridSearchOptions, IndexError,
-    InvertedIndex, SnapshotError, TextEmbedder, VectorError, VectorIndex, hybrid_search, snapshot,
+    ChunkingConfig, ChunkingError, DocId, EmbeddingConfig, EmbeddingError, HybridSearchOptions,
+    IndexError, LexicalIndex, SnapshotError, TextEmbedder, VectorError, VectorIndex,
+    reciprocal_rank_fusion, snapshot,
 };
+
+/// A passage ID, distinct from the ID of its source document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ChunkId(pub u32);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Chunk {
+    pub doc_id: DocId,
+    pub byte_range: Range<usize>,
+}
+
+/// A ranked passage. Multiple hits can belong to the same source document.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ChunkHit {
+    pub chunk_id: ChunkId,
+    pub doc_id: DocId,
+    pub score: f64,
+    pub bm25_rank: Option<usize>,
+    pub vector_rank: Option<usize>,
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum CollectionError {
     #[error(transparent)]
     Embedding(#[from] EmbeddingError),
+    #[error(transparent)]
+    Chunking(#[from] ChunkingError),
     #[error(transparent)]
     Index(#[from] IndexError),
     #[error(transparent)]
@@ -17,198 +42,228 @@ pub enum CollectionError {
     Snapshot(#[from] SnapshotError),
 }
 
-/// An append-only, in-memory collection that coordinates embedding and search.
-/// Each document has one vector under the same ID in both indexes. Private
-/// indexes keep callers from changing one without updating the other.
+/// Original text is owned once; chunks reference byte ranges in that text.
+#[derive(Debug)]
+pub(crate) struct CollectionData {
+    pub(crate) documents: Vec<String>,
+    pub(crate) chunks: Vec<Chunk>,
+    pub(crate) bm25: LexicalIndex,
+    pub(crate) vectors: VectorIndex,
+}
+
+impl CollectionData {
+    pub(crate) fn new(dimensions: usize) -> Result<Self, VectorError> {
+        Ok(Self {
+            documents: Vec::new(),
+            chunks: Vec::new(),
+            bm25: LexicalIndex::default(),
+            vectors: VectorIndex::new(dimensions)?,
+        })
+    }
+
+    /// Caller validates ranges and normalized vectors. All fallible lexical
+    /// preparation happens before changing any of the document/chunk stores.
+    pub(crate) fn append_document(
+        &mut self,
+        text: String,
+        ranges: Vec<Range<usize>>,
+        embeddings: Vec<Vec<f32>>,
+    ) -> Result<DocId, IndexError> {
+        debug_assert!(!ranges.is_empty());
+        debug_assert_eq!(ranges.len(), embeddings.len());
+        let doc_id =
+            DocId::try_from(self.documents.len()).map_err(|_| IndexError::TooManyDocuments)?;
+        self.bm25.check_capacity(ranges.len())?;
+        let normalized: Vec<_> = ranges
+            .iter()
+            .map(|range| text[range.clone()].to_lowercase())
+            .collect();
+        let prepared: Vec<_> = normalized
+            .iter()
+            .map(|text| LexicalIndex::prepare(text))
+            .collect::<Result<_, _>>()?;
+        for ((prepared, range), embedding) in prepared.into_iter().zip(ranges).zip(embeddings) {
+            let chunk_id = self.bm25.append(prepared);
+            debug_assert_eq!(chunk_id as usize, self.chunks.len());
+            self.vectors.append_normalized(chunk_id, &embedding);
+            self.chunks.push(Chunk {
+                doc_id,
+                byte_range: range,
+            });
+        }
+        self.documents.push(text);
+        Ok(doc_id)
+    }
+
+    pub(crate) fn search(
+        &self,
+        query: &str,
+        query_vector: &[f32],
+        options: HybridSearchOptions,
+    ) -> Result<Vec<ChunkHit>, VectorError> {
+        let depth = if options.limit == 0 {
+            0
+        } else {
+            options.candidate_depth
+        };
+        let vector_hits = self.vectors.search(query_vector, depth)?;
+        let bm25_hits = self.bm25.search(query, depth);
+        Ok(
+            reciprocal_rank_fusion(&bm25_hits, &vector_hits, options.limit)
+                .into_iter()
+                .map(|hit| ChunkHit {
+                    chunk_id: ChunkId(hit.doc_id),
+                    doc_id: self.chunks[hit.doc_id as usize].doc_id,
+                    score: hit.score,
+                    bm25_rank: hit.bm25_rank,
+                    vector_rank: hit.vector_rank,
+                })
+                .collect(),
+        )
+    }
+}
+
+/// Append-only documents with token-sized searchable passages. BM25 and vector
+/// search both rank chunks; len() and document() refer to source documents.
 pub struct Collection {
     embedder: TextEmbedder,
-    bm25: InvertedIndex,
-    vectors: VectorIndex,
+    chunker: Chunker,
+    data: CollectionData,
 }
 
 impl Collection {
-    /// Create an empty collection and load its reusable embedding model.
     pub fn new() -> Result<Self, CollectionError> {
-        Self::from_embedder(TextEmbedder::new()?)
+        Self::with_chunking(ChunkingConfig::default())
     }
 
-    /// Use an already loaded embedder, for example one with a custom cache.
+    pub fn with_chunking(config: ChunkingConfig) -> Result<Self, CollectionError> {
+        config.validate(crate::embeddings::CONFIG.max_tokens)?;
+        Self::from_embedder_with_chunking(TextEmbedder::new()?, config)
+    }
+
     pub fn from_embedder(embedder: TextEmbedder) -> Result<Self, CollectionError> {
-        let vectors = VectorIndex::new(embedder.dimensions())?;
+        Self::from_embedder_with_chunking(embedder, ChunkingConfig::default())
+    }
+
+    pub fn from_embedder_with_chunking(
+        embedder: TextEmbedder,
+        config: ChunkingConfig,
+    ) -> Result<Self, CollectionError> {
+        let data = CollectionData::new(embedder.dimensions())?;
+        Self::from_data(embedder, data, config)
+    }
+
+    fn from_data(
+        embedder: TextEmbedder,
+        data: CollectionData,
+        config: ChunkingConfig,
+    ) -> Result<Self, CollectionError> {
+        let chunker = Chunker::new(
+            embedder.tokenizer().clone(),
+            config,
+            embedder.config().max_tokens,
+        )?;
         Ok(Self {
             embedder,
-            bm25: InvertedIndex::new(),
-            vectors,
+            chunker,
+            data,
         })
     }
 
-    /// Save documents and their existing embeddings, replacing any previous
-    /// snapshot only after a temporary file has been fully written and synced.
-    /// The parent directory must already exist. On Unix it is synced after
-    /// replacement; a SyncAfterReplace error means replacement already occurred.
+    /// Atomic replacement after writing and syncing the temporary file. The
+    /// parent directory must exist. SyncAfterReplace means the new file exists
+    /// but syncing its parent directory failed (Unix only).
     pub fn save_snapshot(&self, path: impl AsRef<Path>) -> Result<(), CollectionError> {
         Ok(snapshot::save(
             path.as_ref(),
-            &self.bm25,
-            &self.vectors,
+            &self.data,
             self.embedding_config(),
+            self.chunking_config(),
         )?)
     }
 
-    /// Restore stable IDs and stored embeddings, rebuilding BM25 from text.
-    /// Validate the snapshot before loading the model; document embeddings are
-    /// never recomputed. Model files still need to be cached or downloaded.
+    /// Restore stored boundaries and vectors without chunking or embedding the
+    /// documents again. Version 1 snapshots become one chunk per document.
     pub fn load_snapshot(path: impl AsRef<Path>) -> Result<Self, CollectionError> {
-        let (bm25, vectors) = snapshot::load(path.as_ref(), &crate::embeddings::CONFIG)?;
-        Ok(Self {
-            embedder: TextEmbedder::new()?,
-            bm25,
-            vectors,
-        })
+        let (data, config) = snapshot::load(path.as_ref(), &crate::embeddings::CONFIG)?;
+        Self::from_data(TextEmbedder::new()?, data, config)
     }
 
-    /// Restore using a model that is already loaded, including a custom cache.
     pub fn load_snapshot_with_embedder(
         path: impl AsRef<Path>,
         embedder: TextEmbedder,
     ) -> Result<Self, CollectionError> {
-        let (bm25, vectors) = snapshot::load(path.as_ref(), embedder.config())?;
-        Ok(Self {
-            embedder,
-            bm25,
-            vectors,
-        })
+        let (data, config) = snapshot::load(path.as_ref(), embedder.config())?;
+        Self::from_data(embedder, data, config)
     }
 
     pub fn len(&self) -> usize {
-        self.bm25.len()
+        self.data.documents.len()
     }
-
     pub fn is_empty(&self) -> bool {
-        self.bm25.is_empty()
+        self.data.documents.is_empty()
+    }
+    pub fn chunk_count(&self) -> usize {
+        self.data.chunks.len()
     }
 
     pub fn document(&self, doc_id: DocId) -> Option<&str> {
-        self.bm25.document(doc_id)
+        self.data.documents.get(doc_id as usize).map(String::as_str)
+    }
+
+    pub fn chunk(&self, chunk_id: ChunkId) -> Option<&Chunk> {
+        self.data.chunks.get(chunk_id.0 as usize)
+    }
+
+    pub fn chunk_text(&self, chunk_id: ChunkId) -> Option<&str> {
+        let chunk = self.chunk(chunk_id)?;
+        self.document(chunk.doc_id)?.get(chunk.byte_range.clone())
     }
 
     pub fn embedding_config(&self) -> &'static EmbeddingConfig {
         self.embedder.config()
     }
-
-    /// Embed and index one document, assigning its stable ID automatically.
-    /// Returned errors leave document storage and both indexes unchanged.
-    /// Text is subject to the embedder's blank-text and token-limit policies.
-    pub fn add_document(&mut self, text: impl Into<String>) -> Result<DocId, CollectionError> {
-        let text = text.into();
-        let mut embeddings = self.embedder.embed_documents(&[text.as_str()])?;
-
-        // embed_documents checks that exactly one vector was returned.
-        let embedding = embeddings.remove(0);
-        index_document(&mut self.bm25, &mut self.vectors, text, &embedding)
+    pub fn chunking_config(&self) -> ChunkingConfig {
+        self.chunker.config()
     }
 
-    /// Embed the query once, retrieve from both indexes, and fuse their ranks.
-    /// Needs mutable access because the inference runtime uses mutable state.
-    /// Blank queries return an error, including when depth or limit is zero.
+    /// Split and embed every passage before publishing a document. Returned
+    /// errors leave documents, chunks, indexes, and the next IDs unchanged.
+    pub fn add_document(&mut self, text: impl Into<String>) -> Result<DocId, CollectionError> {
+        let text = text.into();
+        if text.trim().is_empty() {
+            return Err(EmbeddingError::EmptyText { index: 0 }.into());
+        }
+        let ranges = self.chunker.ranges(&text)?;
+        let passages: Vec<_> = ranges.iter().map(|range| &text[range.clone()]).collect();
+        let embeddings = self.embedder.embed_documents(&passages)?;
+        index_document(&mut self.data, text, ranges, embeddings)
+    }
+
+    /// Rank passages, including their parent document IDs. The limit counts
+    /// chunks, not distinct documents. Blank queries error even at limit zero.
     pub fn search(
         &mut self,
         query: &str,
         options: HybridSearchOptions,
-    ) -> Result<Vec<HybridHit>, CollectionError> {
+    ) -> Result<Vec<ChunkHit>, CollectionError> {
         let query_vector = self.embedder.embed_query(query)?;
-        Ok(hybrid_search(
-            &self.bm25,
-            &self.vectors,
-            query,
-            &query_vector,
-            options,
-        )?)
+        Ok(self.data.search(query, &query_vector, options)?)
     }
 }
 
 fn index_document(
-    bm25: &mut InvertedIndex,
-    vectors: &mut VectorIndex,
+    data: &mut CollectionData,
     text: String,
-    embedding: &[f32],
+    ranges: Vec<Range<usize>>,
+    embeddings: Vec<Vec<f32>>,
 ) -> Result<DocId, CollectionError> {
-    debug_assert_eq!(bm25.len(), vectors.len());
-
-    // Validate before changing either index. BM25 also checks its limits before
-    // mutation; once it succeeds, the validated vector append cannot error.
-    let normalized = vectors.normalize(embedding)?;
-    let doc_id = bm25.add_document(text)?;
-    vectors.append_normalized(doc_id, &normalized);
-
-    Ok(doc_id)
+    let normalized: Vec<_> = embeddings
+        .iter()
+        .map(|embedding| data.vectors.normalize(embedding))
+        .collect::<Result<_, _>>()?;
+    Ok(data.append_document(text, ranges, normalized)?)
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn coordinated_insertion_assigns_matching_ids_and_normalizes_vectors() {
-        let mut bm25 = InvertedIndex::new();
-        let mut vectors = VectorIndex::new(2).unwrap();
-        let first = index_document(&mut bm25, &mut vectors, "rust".into(), &[3.0, 4.0]).unwrap();
-        let second = index_document(&mut bm25, &mut vectors, "engine".into(), &[0.0, 1.0]).unwrap();
-        assert_eq!((first, second), (0, 1));
-        assert_eq!(bm25.len(), vectors.len());
-        assert_eq!(bm25.document(first), Some("rust"));
-        assert_eq!(vectors.vector(first), Some(&[0.6, 0.8][..]));
-        assert_eq!(bm25.search("rust", 1)[0].doc_id, first);
-        assert_eq!(vectors.search(&[1.0, 0.0], 1).unwrap()[0].doc_id, first);
-    }
-
-    #[test]
-    fn invalid_embeddings_leave_existing_text_postings_vectors_and_ids_unchanged() {
-        let mut bm25 = InvertedIndex::new();
-        let mut vectors = VectorIndex::new(2).unwrap();
-        index_document(&mut bm25, &mut vectors, "rust".into(), &[1.0, 0.0]).unwrap();
-        let lexical_before = bm25.search("rust", 10);
-        let vector_before = vectors.search(&[1.0, 0.0], 10).unwrap();
-        for (embedding, expected) in [
-            (
-                vec![1.0],
-                VectorError::DimensionMismatch {
-                    expected: 2,
-                    actual: 1,
-                },
-            ),
-            (vec![0.0, 0.0], VectorError::ZeroVector),
-            (
-                vec![f32::NAN, 1.0],
-                VectorError::NonFiniteComponent { index: 0 },
-            ),
-            (
-                vec![1.0, f32::INFINITY],
-                VectorError::NonFiniteComponent { index: 1 },
-            ),
-        ] {
-            let result = index_document(
-                &mut bm25,
-                &mut vectors,
-                "engine rust rust".into(),
-                &embedding,
-            );
-            match result {
-                Err(CollectionError::Vector(error)) => assert_eq!(error, expected),
-                other => panic!("expected vector error, got {other:?}"),
-            }
-            assert_eq!(bm25.len(), 1);
-            assert_eq!(vectors.len(), 1);
-            assert_eq!(bm25.document(0), Some("rust"));
-            assert!(bm25.document(1).is_none());
-            assert!(bm25.postings("engine").is_empty());
-            assert!(vectors.vector(1).is_none());
-            assert_eq!(bm25.search("rust", 10), lexical_before);
-            assert_eq!(vectors.search(&[1.0, 0.0], 10).unwrap(), vector_before);
-        }
-        assert_eq!(
-            index_document(&mut bm25, &mut vectors, "engine".into(), &[0.0, 1.0]).unwrap(),
-            1
-        );
-    }
-}
+mod tests;

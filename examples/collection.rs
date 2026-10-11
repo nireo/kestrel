@@ -18,12 +18,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Query: {query}\n");
     for hit in collection.search(query, HybridSearchOptions::default())? {
         println!(
-            "{:.6}  doc {}  BM25 rank {:?}  vector rank {:?}  {}",
+            "{:.6}  doc {}  chunk {}  BM25 rank {:?}  vector rank {:?}  {}",
             hit.score,
             hit.doc_id,
+            hit.chunk_id.0,
             hit.bm25_rank,
             hit.vector_rank,
-            collection.document(hit.doc_id).unwrap()
+            collection.chunk_text(hit.chunk_id).unwrap()
         );
     }
     Ok(())

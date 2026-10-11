@@ -29,10 +29,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         HybridSearchOptions::default(),
     )? {
         println!(
-            "{:.6}  doc {}  {}",
+            "{:.6}  doc {}  chunk {}  {}",
             hit.score,
             hit.doc_id,
-            collection.document(hit.doc_id).unwrap()
+            hit.chunk_id.0,
+            collection.chunk_text(hit.chunk_id).unwrap()
         );
     }
     Ok(())

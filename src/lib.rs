@@ -1,13 +1,15 @@
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
+mod chunking;
 mod collection;
 mod embeddings;
 mod hybrid;
 mod snapshot;
 mod vector;
 
-pub use collection::{Collection, CollectionError};
+pub use chunking::{ChunkingConfig, ChunkingError};
+pub use collection::{Chunk, ChunkHit, ChunkId, Collection, CollectionError};
 pub use embeddings::{EmbeddingConfig, EmbeddingError, TextEmbedder};
 pub use hybrid::{HybridHit, HybridSearchOptions, hybrid_search, reciprocal_rank_fusion};
 pub use snapshot::SnapshotError;
@@ -43,11 +45,22 @@ pub enum IndexError {
 /// the corpus size and average document length.
 #[derive(Debug, Default)]
 pub struct InvertedIndex {
-    terms: HashMap<Box<str>, Vec<Posting>>,
-    // Keep text out of the scoring path; only document_lengths is read there.
+    core: LexicalIndex,
     documents: Vec<String>,
+}
+
+/// Scoring data shared by standalone document search and collection chunks.
+/// It owns no source text. IDs are dense row numbers chosen by insertion order.
+#[derive(Debug, Default)]
+pub(crate) struct LexicalIndex {
+    terms: HashMap<Box<str>, Vec<Posting>>,
     document_lengths: Vec<u32>,
     total_tokens: u64,
+}
+
+pub(crate) struct PreparedText<'a> {
+    frequencies: HashMap<&'a str, u32>,
+    length: u32,
 }
 
 impl InvertedIndex {
@@ -58,21 +71,87 @@ impl InvertedIndex {
     /// Append a document, assigning its position in the document store as its ID.
     /// Errors leave the index unchanged.
     pub fn add_document(&mut self, text: impl Into<String>) -> Result<DocId, IndexError> {
-        let doc_id =
-            DocId::try_from(self.documents.len()).map_err(|_| IndexError::TooManyDocuments)?;
+        self.core.check_capacity(1)?;
         let text = text.into();
         let normalized = text.to_lowercase();
+        let prepared = LexicalIndex::prepare(&normalized)?;
+        let doc_id = self.core.append(prepared);
+        self.documents.push(text);
+        Ok(doc_id)
+    }
+
+    pub fn len(&self) -> usize {
+        self.core.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.core.is_empty()
+    }
+
+    pub fn vocabulary_len(&self) -> usize {
+        self.core.terms.len()
+    }
+
+    pub fn document(&self, doc_id: DocId) -> Option<&str> {
+        self.documents.get(doc_id as usize).map(String::as_str)
+    }
+
+    pub fn document_length(&self, doc_id: DocId) -> Option<u32> {
+        self.core.document_lengths.get(doc_id as usize).copied()
+    }
+
+    pub fn average_document_length(&self) -> f64 {
+        self.core.average_document_length()
+    }
+
+    /// Inspect a posting list using an already normalized, single term.
+    pub fn postings(&self, term: &str) -> &[Posting] {
+        self.core.postings(term)
+    }
+
+    /// Rank documents matching ANY query term using BM25 (k1 = 1.2, b = 0.75).
+    /// Repeated terms count once. Ties prefer lower IDs; scores are not probabilities.
+    pub fn search(&self, query: &str, limit: usize) -> Vec<SearchHit> {
+        self.core.search(query, limit)
+    }
+}
+
+impl LexicalIndex {
+    pub(crate) fn check_capacity(&self, additional: usize) -> Result<(), IndexError> {
+        let count = self
+            .len()
+            .checked_add(additional)
+            .ok_or(IndexError::TooManyDocuments)?;
+        if count != 0 {
+            DocId::try_from(count - 1).map_err(|_| IndexError::TooManyDocuments)?;
+        }
+        Ok(())
+    }
+
+    /// Borrow counts from a caller-owned lowercase buffer. Prepare all chunks
+    /// before committing any, without allocating dictionary keys per document.
+    pub(crate) fn prepare(normalized: &str) -> Result<PreparedText<'_>, IndexError> {
         let mut frequencies = HashMap::<&str, u32>::new();
         let mut length = 0_u32;
 
         // Borrow terms from one normalized buffer instead of allocating a
         // separate String for every token. Repeated tokens share one count.
-        for term in tokens(&normalized) {
+        for term in tokens(normalized) {
             length = length.checked_add(1).ok_or(IndexError::DocumentTooLong)?;
             *frequencies.entry(term).or_default() += 1;
         }
 
-        for (term, term_frequency) in frequencies {
+        Ok(PreparedText {
+            frequencies,
+            length,
+        })
+    }
+
+    pub(crate) fn append(&mut self, prepared: PreparedText<'_>) -> DocId {
+        debug_assert!(self.check_capacity(1).is_ok());
+        let doc_id = self.len() as DocId;
+
+        for (term, term_frequency) in prepared.frequencies {
             let posting = Posting {
                 doc_id,
                 term_frequency,
@@ -87,30 +166,17 @@ impl InvertedIndex {
         }
 
         // IDs only increase, so every posting list stays sorted without sorting.
-        self.documents.push(text);
-        self.document_lengths.push(length);
-        self.total_tokens += u64::from(length);
-        Ok(doc_id)
+        self.document_lengths.push(prepared.length);
+        self.total_tokens += u64::from(prepared.length);
+        doc_id
     }
 
     pub fn len(&self) -> usize {
-        self.documents.len()
+        self.document_lengths.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.documents.is_empty()
-    }
-
-    pub fn vocabulary_len(&self) -> usize {
-        self.terms.len()
-    }
-
-    pub fn document(&self, doc_id: DocId) -> Option<&str> {
-        self.documents.get(doc_id as usize).map(String::as_str)
-    }
-
-    pub fn document_length(&self, doc_id: DocId) -> Option<u32> {
-        self.document_lengths.get(doc_id as usize).copied()
+        self.document_lengths.is_empty()
     }
 
     pub fn average_document_length(&self) -> f64 {

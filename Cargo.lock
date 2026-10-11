@@ -892,6 +892,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
+ "tokenizers",
 ]
 
 [[package]]

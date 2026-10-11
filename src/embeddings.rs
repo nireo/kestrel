@@ -85,6 +85,10 @@ impl TextEmbedder {
         CONFIG.dimensions
     }
 
+    pub(crate) fn tokenizer(&self) -> &tokenizers::Tokenizer {
+        &self.model.tokenizer
+    }
+
     /// Embed documents in batches, preserving input order. No instruction is
     /// added to passages. Empty batches return no vectors; blank texts error.
     pub fn embed_documents(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
