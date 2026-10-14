@@ -2,6 +2,8 @@
 
 #[path = "benchmark/data.rs"]
 mod data;
+#[path = "benchmark/ivf.rs"]
+mod ivf;
 #[path = "benchmark/measure.rs"]
 mod measure;
 
@@ -27,6 +29,10 @@ struct Config {
     warmup: usize,
     limit: usize,
     candidate_depth: usize,
+    ivf_clusters: Option<usize>,
+    ivf_probes: Vec<usize>,
+    ivf_samples: usize,
+    ivf_iterations: usize,
     dataset: Option<PathBuf>,
     output: Option<PathBuf>,
 }
@@ -42,6 +48,10 @@ impl Default for Config {
             warmup: 1,
             limit: 10,
             candidate_depth: 50,
+            ivf_clusters: None,
+            ivf_probes: vec![1, 4, 16],
+            ivf_samples: 4096,
+            ivf_iterations: 12,
             dataset: None,
             output: None,
         }
@@ -53,6 +63,7 @@ impl Config {
         let mut config = Self::default();
         let mut args = args.into_iter();
         let mut synthetic_options = false;
+        let mut ivf_options = false;
         while let Some(arg) = args.next() {
             if arg == "--help" || arg == "-h" {
                 println!(
@@ -66,6 +77,10 @@ impl Config {
                     --warmup 1                Untimed passes per method (may be zero)\n\
                     --limit 10                Returned results per query\n\
                     --candidate-depth 50      Candidates per source in hybrid search\n\
+                    --ivf-clusters N          Enable IVF-flat comparison with N clusters\n\
+                    --ivf-probes 1,4,16        Cluster probe counts to compare\n\
+                    --ivf-samples 4096         Maximum training vectors (seed 42)\n\
+                    --ivf-iterations 12        Maximum spherical k-means iterations\n\
                     --output PATH             Save JSON report and exact neighbors"
                 );
                 return Ok(None);
@@ -82,6 +97,13 @@ impl Config {
                 "--warmup" => config.warmup = value.parse()?,
                 "--limit" => config.limit = value.parse()?,
                 "--candidate-depth" => config.candidate_depth = value.parse()?,
+                "--ivf-clusters" => config.ivf_clusters = Some(value.parse()?),
+                "--ivf-probes" => {
+                    config.ivf_probes =
+                        value.split(',').map(str::parse).collect::<Result<_, _>>()?
+                }
+                "--ivf-samples" => config.ivf_samples = value.parse()?,
+                "--ivf-iterations" => config.ivf_iterations = value.parse()?,
                 "--dataset" => config.dataset = Some(value.into()),
                 "--output" => config.output = Some(value.into()),
                 _ => return Err(format!("unknown argument: {arg}").into()),
@@ -90,9 +112,28 @@ impl Config {
                 arg.as_str(),
                 "--sizes" | "--dimensions" | "--queries" | "--seed"
             );
+            ivf_options |= matches!(
+                arg.as_str(),
+                "--ivf-probes" | "--ivf-samples" | "--ivf-iterations"
+            );
         }
         if config.dataset.is_some() && synthetic_options {
             return Err("--dataset cannot be combined with synthetic input options".into());
+        }
+        if ivf_options && config.ivf_clusters.is_none() {
+            return Err("IVF options require --ivf-clusters".into());
+        }
+        if let Some(clusters) = config.ivf_clusters
+            && (clusters == 0
+                || config.ivf_samples < clusters
+                || config.ivf_iterations == 0
+                || config.ivf_probes.is_empty()
+                || config.ivf_probes.contains(&0))
+        {
+            return Err(
+                "IVF needs positive clusters, probes and iterations, with samples >= clusters"
+                    .into(),
+            );
         }
         if config.sizes.is_empty()
             || config
@@ -142,6 +183,7 @@ struct Run {
     hybrid: Timing,
     /// Entry i is the exact vector top-k for dataset.queries[i]. IDs are row numbers.
     exact_neighbors: Vec<Vec<Neighbor>>,
+    ivf: Option<ivf::IvfReport>,
 }
 
 #[derive(Serialize)]
@@ -282,7 +324,7 @@ fn run(config: &Config, count: usize) -> Result<Run, Error> {
             .unwrap_or("unavailable".into())
     );
     println!(
-        "{:<8} {:>10} {:>10} {:>10} {:>12}",
+        "{:<12} {:>10} {:>10} {:>10} {:>12}",
         "Method", "p50 ms", "p95 ms", "p99 ms", "seq QPS"
     );
     let bm25_timing = measure::measure(
@@ -323,6 +365,8 @@ fn run(config: &Config, count: usize) -> Result<Run, Error> {
         |_, _| {},
     )?;
     print_timing("Hybrid", &hybrid_timing);
+    let peak_rss_after_queries_bytes = peak_rss_bytes();
+    let ivf = ivf::run(config, &bm25, &vectors, &header, &exact_neighbors)?;
     Ok(Run {
         dataset: header,
         workload_fingerprint: fingerprint.finish(),
@@ -334,17 +378,18 @@ fn run(config: &Config, count: usize) -> Result<Run, Error> {
         vector_build_ms: vector_build.as_secs_f64() * 1000.0,
         peak_rss_before_build_bytes,
         peak_rss_after_build_bytes,
-        peak_rss_after_queries_bytes: peak_rss_bytes(),
+        peak_rss_after_queries_bytes,
         bm25: bm25_timing,
         vector: vector_timing,
         hybrid: hybrid_timing,
         exact_neighbors,
+        ivf,
     })
 }
 
 fn print_timing(name: &str, timing: &Timing) {
     println!(
-        "{name:<8} {:>10.3} {:>10.3} {:>10.3} {:>12.1}",
+        "{name:<12} {:>10.3} {:>10.3} {:>10.3} {:>12.1}",
         timing.p50_us / 1000.0,
         timing.p95_us / 1000.0,
         timing.p99_us / 1000.0,
@@ -378,7 +423,7 @@ fn main() -> Result<(), Error> {
         runs.push(run(&config, size)?);
     }
     let report = Report {
-        report_version: 1,
+        report_version: 2,
         unix_timestamp_seconds: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs(),
@@ -413,6 +458,10 @@ mod tests {
             vec!["--rounds", "0"],
             vec!["--limit", "51"],
             vec!["--dataset", "data.jsonl", "--seed", "42"],
+            vec!["--ivf-probes", "1,4"],
+            vec!["--ivf-clusters", "0"],
+            vec!["--ivf-clusters", "8", "--ivf-probes", "0"],
+            vec!["--ivf-clusters", "8", "--ivf-samples", "4"],
         ] {
             assert!(Config::parse(args.into_iter().map(String::from)).is_err());
         }
@@ -462,5 +511,29 @@ mod tests {
             }
         }
         assert_eq!(result.vector_payload_bytes, 70 * 8 * 4);
+    }
+
+    #[test]
+    fn ivf_report_measures_recall_against_exact_query_neighbors() {
+        // Also check the recall denominator when k exceeds the corpus size.
+        for limit in [3, 100] {
+            let config = Config {
+                dimensions: 8,
+                queries: 4,
+                rounds: 1,
+                warmup: 0,
+                limit,
+                candidate_depth: limit,
+                ivf_clusters: Some(8),
+                ivf_samples: 128,
+                ivf_probes: vec![1, 8],
+                ..Config::default()
+            };
+            let result = run(&config, 70).unwrap();
+            let probes = result.ivf.unwrap().probes;
+            assert_eq!(probes[1].probes, 8);
+            assert_eq!(probes[1].mean_recall_at_k, 1.0);
+            assert!(probes[0].mean_recall_at_k >= 0.0 && probes[0].mean_recall_at_k <= 1.0);
+        }
     }
 }

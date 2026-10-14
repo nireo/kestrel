@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::{DocId, InvertedIndex, SearchHit, VectorError, VectorIndex, top_k};
+use crate::{DocId, InvertedIndex, IvfError, IvfIndex, SearchHit, VectorError, VectorIndex, top_k};
 
 const RRF_K: f64 = 60.0;
 
@@ -111,6 +111,31 @@ pub fn hybrid_search(
 
     // Validate the vector query before spending work on lexical retrieval.
     let vector_hits = vectors.search(query_vector, depth)?;
+    let bm25_hits = bm25.search(query, depth);
+    Ok(reciprocal_rank_fusion(
+        &bm25_hits,
+        &vector_hits,
+        options.limit,
+    ))
+}
+
+/// Hybrid search using an immutable IVF index and an explicit cluster probe count.
+/// ID alignment, candidate depth, fusion and tie ordering match hybrid_search().
+/// Vector approximation can change the candidate list and fused results.
+pub fn hybrid_search_ivf(
+    bm25: &InvertedIndex,
+    vectors: &IvfIndex,
+    query: &str,
+    query_vector: &[f32],
+    options: HybridSearchOptions,
+    probes: usize,
+) -> Result<Vec<HybridHit>, IvfError> {
+    let depth = if options.limit == 0 {
+        0
+    } else {
+        options.candidate_depth
+    };
+    let vector_hits = vectors.search(query_vector, depth, probes)?;
     let bm25_hits = bm25.search(query, depth);
     Ok(reciprocal_rank_fusion(
         &bm25_hits,

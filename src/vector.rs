@@ -105,11 +105,7 @@ impl VectorIndex {
             .zip(&self.doc_ids)
             .map(|(vector, &doc_id)| {
                 // Cosine similarity is just a dot product for unit vectors.
-                let score: f64 = vector
-                    .iter()
-                    .zip(&query)
-                    .map(|(&a, &b)| f64::from(a) * f64::from(b))
-                    .sum();
+                let score = dot(vector, &query);
                 SearchHit {
                     doc_id,
                     // Stored f32 unit vectors can round slightly outside [-1, 1].
@@ -120,43 +116,62 @@ impl VectorIndex {
     }
 
     pub(crate) fn normalize(&self, vector: &[f32]) -> Result<Vec<f32>, VectorError> {
-        let length = self.vector_length(vector)?;
-        Ok(vector
-            .iter()
-            .map(|&component| (f64::from(component) / length) as f32)
-            .collect())
+        normalize(vector, self.dimensions)
+    }
+
+    pub(crate) fn row(&self, row: usize) -> (DocId, &[f32]) {
+        let start = row * self.dimensions;
+        (
+            self.doc_ids[row],
+            &self.vectors[start..start + self.dimensions],
+        )
     }
 
     /// Check a stored vector without changing its float values during restore.
     pub(crate) fn validate_normalized(&self, vector: &[f32]) -> Result<(), VectorError> {
-        let length = self.vector_length(vector)?;
+        let length = vector_length(vector, self.dimensions)?;
         // Allow rounding from f64 normalization back to stored f32 components.
         if (length - 1.0).abs() > 1e-5 {
             return Err(VectorError::NotNormalized);
         }
         Ok(())
     }
+}
 
-    fn vector_length(&self, vector: &[f32]) -> Result<f64, VectorError> {
-        if vector.len() != self.dimensions {
-            return Err(VectorError::DimensionMismatch {
-                expected: self.dimensions,
-                actual: vector.len(),
-            });
-        }
-        let mut squared_length = 0.0_f64;
-        for (index, &component) in vector.iter().enumerate() {
-            if !component.is_finite() {
-                return Err(VectorError::NonFiniteComponent { index });
-            }
-            // Promote BEFORE squaring: finite f32 values can overflow or
-            // underflow when squared in f32, but their squares fit in f64.
-            let component = f64::from(component);
-            squared_length += component * component;
-        }
-        if squared_length == 0.0 {
-            return Err(VectorError::ZeroVector);
-        }
-        Ok(squared_length.sqrt())
+pub(crate) fn dot(a: &[f32], b: &[f32]) -> f64 {
+    a.iter()
+        .zip(b)
+        .map(|(&a, &b)| f64::from(a) * f64::from(b))
+        .sum()
+}
+
+pub(crate) fn normalize(vector: &[f32], dimensions: usize) -> Result<Vec<f32>, VectorError> {
+    let length = vector_length(vector, dimensions)?;
+    Ok(vector
+        .iter()
+        .map(|&component| (f64::from(component) / length) as f32)
+        .collect())
+}
+
+fn vector_length(vector: &[f32], dimensions: usize) -> Result<f64, VectorError> {
+    if vector.len() != dimensions {
+        return Err(VectorError::DimensionMismatch {
+            expected: dimensions,
+            actual: vector.len(),
+        });
     }
+    let mut squared_length = 0.0_f64;
+    for (index, &component) in vector.iter().enumerate() {
+        if !component.is_finite() {
+            return Err(VectorError::NonFiniteComponent { index });
+        }
+        // Promote BEFORE squaring: finite f32 values can overflow or
+        // underflow when squared in f32, but their squares fit in f64.
+        let component = f64::from(component);
+        squared_length += component * component;
+    }
+    if squared_length == 0.0 {
+        return Err(VectorError::ZeroVector);
+    }
+    Ok(squared_length.sqrt())
 }
