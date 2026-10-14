@@ -887,6 +887,7 @@ name = "kestrel"
 version = "0.1.0"
 dependencies = [
  "fastembed",
+ "libc",
  "postcard",
  "serde",
  "serde_json",
