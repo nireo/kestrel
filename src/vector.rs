@@ -99,20 +99,25 @@ impl VectorIndex {
     /// top-k heap uses O(k) space, in addition to the O(D) normalized query.
     pub fn search(&self, query: &[f32], limit: usize) -> Result<Vec<SearchHit>, VectorError> {
         let query = self.normalize(query)?;
+        Ok(self.search_normalized(&query, limit))
+    }
+
+    /// Internal retrieval after the caller has validated and normalized the query.
+    pub(crate) fn search_normalized(&self, query: &[f32], limit: usize) -> Vec<SearchHit> {
         let hits = self
             .vectors
             .chunks_exact(self.dimensions)
             .zip(&self.doc_ids)
             .map(|(vector, &doc_id)| {
                 // Cosine similarity is just a dot product for unit vectors.
-                let score = dot(vector, &query);
+                let score = dot(vector, query);
                 SearchHit {
                     doc_id,
                     // Stored f32 unit vectors can round slightly outside [-1, 1].
                     score: score.clamp(-1.0, 1.0),
                 }
             });
-        Ok(top_k(hits, limit))
+        top_k(hits, limit)
     }
 
     pub(crate) fn normalize(&self, vector: &[f32]) -> Result<Vec<f32>, VectorError> {
@@ -125,16 +130,6 @@ impl VectorIndex {
             self.doc_ids[row],
             &self.vectors[start..start + self.dimensions],
         )
-    }
-
-    /// Check a stored vector without changing its float values during restore.
-    pub(crate) fn validate_normalized(&self, vector: &[f32]) -> Result<(), VectorError> {
-        let length = vector_length(vector, self.dimensions)?;
-        // Allow rounding from f64 normalization back to stored f32 components.
-        if (length - 1.0).abs() > 1e-5 {
-            return Err(VectorError::NotNormalized);
-        }
-        Ok(())
     }
 }
 
@@ -151,6 +146,15 @@ pub(crate) fn normalize(vector: &[f32], dimensions: usize) -> Result<Vec<f32>, V
         .iter()
         .map(|&component| (f64::from(component) / length) as f32)
         .collect())
+}
+
+pub(crate) fn validate_normalized(vector: &[f32], dimensions: usize) -> Result<(), VectorError> {
+    let length = vector_length(vector, dimensions)?;
+    // Allow rounding from f64 normalization back to stored f32 components.
+    if (length - 1.0).abs() > 1e-5 {
+        return Err(VectorError::NotNormalized);
+    }
+    Ok(())
 }
 
 fn vector_length(vector: &[f32], dimensions: usize) -> Result<f64, VectorError> {

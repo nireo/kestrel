@@ -1,4 +1,7 @@
-use kestrel::{Collection, CollectionError, EmbeddingError, HybridSearchOptions, TextEmbedder};
+use kestrel::{
+    Collection, CollectionError, EmbeddingError, HybridSearchOptions, IvfBuildOptions,
+    TextEmbedder, VectorError, VectorSearchMode,
+};
 
 #[test]
 #[ignore = "loads the real model and downloads its files if not cached"]
@@ -72,5 +75,103 @@ fn collection_coordinates_real_embeddings_ids_search_and_failed_insertions()
         2
     );
     assert_eq!(collection.search("keyword search", options)?[0].doc_id, 2);
+    Ok(())
+}
+
+#[test]
+#[ignore = "loads the real model and downloads its files if not cached"]
+fn ivf_collection_supports_buffered_writes_shared_readers_and_snapshot_restore()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut collection = Collection::new()?;
+    collection.add_document("Reset your password using the recovery link in your email.")?;
+    collection.add_document("Cook pasta in salted water and serve with tomato sauce.")?;
+    assert_eq!(collection.vector_search_mode(), VectorSearchMode::Exact);
+    let mode = VectorSearchMode::Ivf {
+        build: IvfBuildOptions {
+            clusters: 2,
+            ..IvfBuildOptions::default()
+        },
+        probes: usize::MAX,
+    };
+    collection.set_vector_search_mode(mode)?;
+    assert_eq!(collection.buffered_vector_count(), 0);
+    let new_id = collection.add_document("Use a security key for passwordless account login.")?;
+    assert_eq!(collection.buffered_vector_count(), 1);
+    let query = "How do I log into my account?";
+    let vector = collection.embed_query(query)?;
+    let options = HybridSearchOptions::default();
+    let expected = collection.search_with_vector(query, &vector, options)?;
+    assert!(
+        expected
+            .iter()
+            .any(|h| h.doc_id == new_id && h.vector_rank.is_some())
+    );
+    assert_eq!(collection.search(query, options)?, expected);
+    std::thread::scope(|scope| {
+        let shared = &collection;
+        let vector = &vector;
+        let readers: Vec<_> = (0..4)
+            .map(|_| {
+                scope.spawn(move || shared.search_with_vector(query, vector, options).unwrap())
+            })
+            .collect();
+        for reader in readers {
+            assert_eq!(reader.join().unwrap(), expected);
+        }
+    });
+    assert!(matches!(
+        collection.search_with_vector(" ", &vector, options),
+        Err(CollectionError::Embedding(EmbeddingError::EmptyText { .. }))
+    ));
+    assert!(matches!(
+        collection.search_with_vector(query, &[1.0], options),
+        Err(CollectionError::Vector(
+            VectorError::DimensionMismatch { .. }
+        ))
+    ));
+    let zero = vec![0.0; vector.len()];
+    assert!(matches!(
+        collection.search_with_vector(
+            query,
+            &zero,
+            HybridSearchOptions {
+                limit: 0,
+                ..options
+            }
+        ),
+        Err(CollectionError::Vector(VectorError::ZeroVector))
+    ));
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("ivf-buffered.kestrel");
+    collection.save_snapshot(&path)?;
+    let saved = std::fs::read(&path)?;
+    collection.rebuild_vector_index()?;
+    assert_eq!(collection.buffered_vector_count(), 0);
+    assert_eq!(
+        collection.search_with_vector(query, &vector, options)?,
+        expected
+    );
+    collection.save_snapshot(&path)?;
+    assert_eq!(std::fs::read(&path)?, saved);
+    collection.set_vector_search_mode(VectorSearchMode::Exact)?;
+    assert_eq!(
+        collection.search_with_vector(query, &vector, options)?,
+        expected
+    );
+    drop(collection);
+    let mut restored = Collection::load_snapshot(&path)?;
+    assert_eq!(restored.vector_search_mode(), VectorSearchMode::Exact);
+    assert_eq!(restored.len(), 3);
+    assert_eq!(
+        restored.search_with_vector(query, &vector, options)?,
+        expected
+    );
+    restored.set_vector_search_mode(mode)?;
+    assert_eq!(
+        restored.search_with_vector(query, &vector, options)?,
+        expected
+    );
+    assert_eq!(restored.add_document("A fourth document.")?, 3);
+    assert_eq!(restored.buffered_vector_count(), 1);
     Ok(())
 }

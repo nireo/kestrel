@@ -4,7 +4,7 @@
 )]
 
 use super::*;
-use crate::{HybridSearchOptions, VectorIndex};
+use crate::{HybridSearchOptions, IvfBuildOptions, VectorIndex, VectorSearchMode};
 
 const CONFIG: EmbeddingConfig = EmbeddingConfig {
     model_id: "test-model",
@@ -157,6 +157,59 @@ fn empty_collection_round_trips() {
     assert!(data.bm25.is_empty());
     assert!(data.vectors.is_empty());
     assert_eq!(chunking, CHUNKING);
+}
+
+#[test]
+fn ivf_snapshot_includes_buffer_and_preserves_float_bits_across_rebuilds() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("buffered.kestrel");
+    let mut original = data();
+    let mode = VectorSearchMode::Ivf {
+        build: IvfBuildOptions {
+            clusters: 2,
+            ..IvfBuildOptions::default()
+        },
+        probes: usize::MAX,
+    };
+    original.vectors.set_mode(mode).unwrap();
+    original
+        .append_document(
+            "new document".into(),
+            vec![0..12],
+            vec![vec![1.0, 0.0, 0.0]],
+        )
+        .unwrap();
+    assert_eq!(original.vectors.buffered_vector_count(), 1);
+    save(&path, &original, &CONFIG, CHUNKING).unwrap();
+    let saved = fs::read(&path).unwrap();
+    let (restored, _) = load(&path, &CONFIG).unwrap();
+    assert_eq!(restored.vectors.mode(), VectorSearchMode::Exact);
+    assert_eq!(restored.documents, original.documents);
+    assert_eq!(restored.chunks, original.chunks);
+    for id in 0..original.chunks.len() as u32 {
+        let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+        assert_eq!(
+            bits(restored.vectors.vector(id).unwrap()),
+            bits(original.vectors.vector(id).unwrap())
+        );
+    }
+    for query in ["rust", "new document", "absent"] {
+        for vector in [[1.0, 0.0, 0.0], [-2.0, 3.0, 1.0]] {
+            let options = HybridSearchOptions::default();
+            assert_eq!(
+                restored.search(query, &vector, options).unwrap(),
+                original.search(query, &vector, options).unwrap()
+            );
+        }
+    }
+    // Runtime layout changes must not change the version-2 snapshot contents.
+    original.vectors.rebuild().unwrap();
+    assert_eq!(original.vectors.buffered_vector_count(), 0);
+    save(&path, &original, &CONFIG, CHUNKING).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), saved);
+    original.vectors.set_mode(VectorSearchMode::Exact).unwrap();
+    save(&path, &original, &CONFIG, CHUNKING).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), saved);
 }
 
 #[test]
@@ -408,12 +461,12 @@ fn save_rejects_missing_vectors_and_mismatched_dimensions_before_replacement() {
     for id in 1..=data.chunks.len() as u32 {
         wrong_ids.insert(id, &[1.0, 0.0, 0.0]).unwrap();
     }
-    data.vectors = wrong_ids;
+    data.vectors = crate::collection::CollectionVectors::Exact(wrong_ids);
     assert!(matches!(
         save(&path, &data, &CONFIG, CHUNKING),
         Err(SnapshotError::InvalidData("chunk has no vector"))
     ));
-    data.vectors = VectorIndex::new(2).unwrap();
+    data.vectors = crate::collection::CollectionVectors::Exact(VectorIndex::new(2).unwrap());
     assert!(save(&path, &data, &CONFIG, CHUNKING).is_err());
     assert_eq!(fs::read(&path).unwrap(), before);
     assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);

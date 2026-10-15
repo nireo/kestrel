@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::vector::{dot, normalize};
 use crate::{DocId, SearchHit, VectorError, VectorIndex, top_k};
 
@@ -25,6 +27,15 @@ impl Default for IvfBuildOptions {
     }
 }
 
+impl IvfBuildOptions {
+    pub(crate) fn validate(self) -> Result<(), IvfError> {
+        if self.clusters == 0 || self.iterations == 0 || self.training_samples < self.clusters {
+            return Err(IvfError::InvalidBuildOptions);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum IvfError {
     #[error("clusters and iterations must be positive, and training_samples must be >= clusters")]
@@ -49,34 +60,45 @@ pub struct IvfIndex {
     offsets: Vec<usize>,
     vectors: Vec<f32>,
     doc_ids: Vec<DocId>,
+    positions: HashMap<DocId, usize>,
 }
 
 impl IvfIndex {
     pub fn build(source: &VectorIndex, options: IvfBuildOptions) -> Result<Self, IvfError> {
-        if options.clusters == 0
-            || options.iterations == 0
-            || options.training_samples < options.clusters
-        {
-            return Err(IvfError::InvalidBuildOptions);
-        }
+        Self::build_from_rows(
+            source.dimensions(),
+            source.len(),
+            |row| source.row(row),
+            options,
+        )
+    }
 
-        let dimensions = source.dimensions();
-        let clusters = options.clusters.min(source.len());
-        if source.is_empty() {
+    /// Borrow rows from existing storage so rebuilding base + buffer needs no
+    /// temporary full-sized exact index. Rows must have unique IDs and unit vectors.
+    pub(crate) fn build_from_rows<'a>(
+        dimensions: usize,
+        count: usize,
+        row_at: impl Fn(usize) -> (DocId, &'a [f32]),
+        options: IvfBuildOptions,
+    ) -> Result<Self, IvfError> {
+        options.validate()?;
+        let clusters = options.clusters.min(count);
+        if count == 0 {
             return Ok(Self {
                 dimensions,
                 centroids: Vec::new(),
                 offsets: vec![0],
                 vectors: Vec::new(),
                 doc_ids: Vec::new(),
+                positions: HashMap::new(),
             });
         }
 
-        let sample = sample_rows(source.len(), options.training_samples, options.seed);
-        let centroids = train(source, &sample, clusters, options.iterations);
+        let sample = sample_rows(count, options.training_samples, options.seed);
+        let centroids = train(&row_at, dimensions, &sample, clusters, options.iterations);
 
-        let assignments: Vec<_> = (0..source.len())
-            .map(|row| nearest(source.row(row).1, &centroids, dimensions))
+        let assignments: Vec<_> = (0..count)
+            .map(|row| nearest(row_at(row).1, &centroids, dimensions))
             .collect();
         let mut offsets = vec![0; clusters + 1];
         for &cluster in &assignments {
@@ -88,13 +110,15 @@ impl IvfIndex {
         }
 
         let mut cursors = offsets[..clusters].to_vec();
-        let mut vectors = vec![0.0; source.len() * dimensions];
-        let mut doc_ids = vec![0; source.len()];
+        let mut vectors = vec![0.0; count * dimensions];
+        let mut doc_ids = vec![0; count];
+        let mut positions = HashMap::with_capacity(count);
         for (row, cluster) in assignments.into_iter().enumerate() {
-            let (id, vector) = source.row(row);
+            let (id, vector) = row_at(row);
             let destination = cursors[cluster];
             cursors[cluster] += 1;
             doc_ids[destination] = id;
+            positions.insert(id, destination);
             vectors[destination * dimensions..(destination + 1) * dimensions]
                 .copy_from_slice(vector);
         }
@@ -105,6 +129,7 @@ impl IvfIndex {
             offsets,
             vectors,
             doc_ids,
+            positions,
         })
     }
 
@@ -119,6 +144,13 @@ impl IvfIndex {
     }
     pub fn cluster_count(&self) -> usize {
         self.offsets.len() - 1
+    }
+
+    /// Borrow an original normalized vector by its stable document ID.
+    pub fn vector(&self, doc_id: DocId) -> Option<&[f32]> {
+        let row = *self.positions.get(&doc_id)?;
+        let start = row * self.dimensions;
+        Some(&self.vectors[start..start + self.dimensions])
     }
 
     /// Includes empty clusters, which can occur for duplicate/degenerate data.
@@ -139,34 +171,51 @@ impl IvfIndex {
         if probes == 0 {
             return Err(IvfError::ZeroProbes);
         }
+
         let query = normalize(query, self.dimensions)?;
+        Ok(self.search_normalized(&query, limit, probes))
+    }
+
+    /// The caller validates/normalizes once when searching multiple vector stores.
+    pub(crate) fn search_normalized(
+        &self,
+        query: &[f32],
+        limit: usize,
+        probes: usize,
+    ) -> Vec<SearchHit> {
+        debug_assert!(probes > 0);
         if limit == 0 || self.is_empty() {
-            return Ok(Vec::new());
+            return Vec::new();
         }
 
-        // No centroid ranking is needed when every cluster will be scanned.
-        let clusters = if probes >= self.cluster_count() {
-            (0..self.cluster_count()).collect::<Vec<_>>()
-        } else {
-            top_k(
-                self.centroids
-                    .chunks_exact(self.dimensions)
-                    .enumerate()
-                    .map(|(cluster, centroid)| SearchHit {
-                        doc_id: cluster as DocId,
-                        score: dot(centroid, &query),
-                    }),
-                probes,
-            )
-            .into_iter()
-            .map(|hit| hit.doc_id as usize)
-            .collect()
-        };
+        // All clusters share one contiguous array, so scan it directly.
+        if probes >= self.cluster_count() {
+            let hits = self
+                .vectors
+                .chunks_exact(self.dimensions)
+                .zip(&self.doc_ids)
+                .map(|(vector, &doc_id)| SearchHit {
+                    doc_id,
+                    score: dot(vector, query).clamp(-1.0, 1.0),
+                });
+            return top_k(hits, limit);
+        }
 
-        let hits = clusters.into_iter().flat_map(|cluster| {
+        let clusters = top_k(
+            self.centroids
+                .chunks_exact(self.dimensions)
+                .enumerate()
+                .map(|(cluster, centroid)| SearchHit {
+                    doc_id: cluster as DocId,
+                    score: dot(centroid, query),
+                }),
+            probes,
+        );
+
+        let hits = clusters.into_iter().flat_map(|hit| {
+            let cluster = hit.doc_id as usize;
             let start = self.offsets[cluster];
             let end = self.offsets[cluster + 1];
-            let query = &query;
             self.vectors[start * self.dimensions..end * self.dimensions]
                 .chunks_exact(self.dimensions)
                 .zip(&self.doc_ids[start..end])
@@ -176,7 +225,7 @@ impl IvfIndex {
                 })
         });
 
-        Ok(top_k(hits, limit))
+        top_k(hits, limit)
     }
 }
 
@@ -190,11 +239,13 @@ fn nearest(vector: &[f32], centroids: &[f32], dimensions: usize) -> usize {
             best_score = score;
         }
     }
+
     best
 }
 
 fn sample_rows(count: usize, maximum: usize, mut state: u64) -> Vec<usize> {
     let mut rows: Vec<_> = (0..count.min(maximum)).collect();
+
     // Reservoir sampling avoids allocating an N-element shuffle permutation.
     for row in rows.len()..count {
         state = state.wrapping_add(0x9e3779b97f4a7c15);
@@ -208,21 +259,27 @@ fn sample_rows(count: usize, maximum: usize, mut state: u64) -> Vec<usize> {
         }
     }
     rows.sort_unstable();
+
     rows
 }
 
-fn train(source: &VectorIndex, sample: &[usize], clusters: usize, iterations: usize) -> Vec<f32> {
-    let dimensions = source.dimensions();
+fn train<'a>(
+    row_at: &impl Fn(usize) -> (DocId, &'a [f32]),
+    dimensions: usize,
+    sample: &[usize],
+    clusters: usize,
+    iterations: usize,
+) -> Vec<f32> {
     let mut centroids = Vec::with_capacity(clusters * dimensions);
     let mut closest = vec![f64::NEG_INFINITY; sample.len()];
     let mut next = 0;
 
     // Farthest-first seeds cover distinct directions, including small clusters.
     for _ in 0..clusters {
-        let centroid = source.row(sample[next]).1;
+        let centroid = row_at(sample[next]).1;
         centroids.extend_from_slice(centroid);
         for (&row, similarity) in sample.iter().zip(&mut closest) {
-            *similarity = similarity.max(dot(source.row(row).1, centroid));
+            *similarity = similarity.max(dot(row_at(row).1, centroid));
         }
         next = closest
             .iter()
@@ -241,7 +298,7 @@ fn train(source: &VectorIndex, sample: &[usize], clusters: usize, iterations: us
         counts.fill(0);
         let mut changed = false;
         for (&row, assignment) in sample.iter().zip(&mut assignments) {
-            let vector = source.row(row).1;
+            let vector = row_at(row).1;
             let cluster = nearest(vector, &centroids, dimensions);
             changed |= *assignment != cluster;
             *assignment = cluster;
@@ -253,9 +310,11 @@ fn train(source: &VectorIndex, sample: &[usize], clusters: usize, iterations: us
                 *sum += f64::from(component);
             }
         }
+
         if !changed {
             break;
         }
+
         for (cluster, count) in counts.iter().enumerate() {
             let sum = &sums[cluster * dimensions..(cluster + 1) * dimensions];
             let length = sum.iter().map(|v| v * v).sum::<f64>().sqrt();

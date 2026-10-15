@@ -4,9 +4,13 @@ use std::path::Path;
 use crate::chunking::Chunker;
 use crate::{
     ChunkingConfig, ChunkingError, DocId, EmbeddingConfig, EmbeddingError, HybridSearchOptions,
-    IndexError, LexicalIndex, SnapshotError, TextEmbedder, VectorError, VectorIndex,
+    IndexError, IvfError, LexicalIndex, SnapshotError, TextEmbedder, VectorError,
     reciprocal_rank_fusion, snapshot,
 };
+
+mod vectors;
+pub(crate) use vectors::CollectionVectors;
+pub use vectors::VectorSearchMode;
 
 /// A passage ID, distinct from the ID of its source document.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -39,6 +43,8 @@ pub enum CollectionError {
     #[error(transparent)]
     Vector(#[from] VectorError),
     #[error(transparent)]
+    Ivf(#[from] IvfError),
+    #[error(transparent)]
     Snapshot(#[from] SnapshotError),
 }
 
@@ -48,7 +54,7 @@ pub(crate) struct CollectionData {
     pub(crate) documents: Vec<String>,
     pub(crate) chunks: Vec<Chunk>,
     pub(crate) bm25: LexicalIndex,
-    pub(crate) vectors: VectorIndex,
+    pub(crate) vectors: CollectionVectors,
 }
 
 impl CollectionData {
@@ -57,7 +63,7 @@ impl CollectionData {
             documents: Vec::new(),
             chunks: Vec::new(),
             bm25: LexicalIndex::default(),
-            vectors: VectorIndex::new(dimensions)?,
+            vectors: CollectionVectors::new(dimensions)?,
         })
     }
 
@@ -170,6 +176,8 @@ impl Collection {
         })
     }
 
+    /// Save all chunk vectors, including buffered IVF writes. Retrieval mode is
+    /// runtime-only; loading starts in exact mode.
     /// Atomic replacement after writing and syncing the temporary file. The
     /// parent directory must exist. SyncAfterReplace means the new file exists
     /// but syncing its parent directory failed (Unix only).
@@ -184,6 +192,7 @@ impl Collection {
 
     /// Restore stored boundaries and vectors without chunking or embedding the
     /// documents again. Version 1 snapshots become one chunk per document.
+    /// Retrieval starts in exact mode; select IVF to train a fresh index.
     pub fn load_snapshot(path: impl AsRef<Path>) -> Result<Self, CollectionError> {
         let (data, config) = snapshot::load(path.as_ref(), &crate::embeddings::CONFIG)?;
         Self::from_data(TextEmbedder::new()?, data, config)
@@ -227,6 +236,37 @@ impl Collection {
         self.chunker.config()
     }
 
+    /// Select exact or IVF retrieval. Changing build settings retrains all chunks;
+    /// changing only probes keeps the existing index and insertion buffer.
+    /// Build failures leave the current backend and buffer unchanged.
+    pub fn set_vector_search_mode(
+        &mut self,
+        mode: VectorSearchMode,
+    ) -> Result<(), CollectionError> {
+        Ok(self.data.vectors.set_mode(mode)?)
+    }
+
+    pub fn vector_search_mode(&self) -> VectorSearchMode {
+        self.data.vectors.mode()
+    }
+
+    /// Number of newly inserted chunk vectors awaiting an explicit IVF rebuild.
+    /// They are already searchable through the exact insertion buffer.
+    pub fn buffered_vector_count(&self) -> usize {
+        self.data.vectors.buffered_vector_count()
+    }
+
+    /// Retrain IVF over all chunks and empty its insertion buffer after success.
+    /// This synchronous operation needs exclusive access; exact mode is a no-op.
+    pub fn rebuild_vector_index(&mut self) -> Result<(), CollectionError> {
+        Ok(self.data.vectors.rebuild()?)
+    }
+
+    /// Prepare a query with the collection's embedding model and instruction.
+    pub fn embed_query(&mut self, query: &str) -> Result<Vec<f32>, CollectionError> {
+        Ok(self.embedder.embed_query(query)?)
+    }
+
     /// Split and embed every passage before publishing a document. Returned
     /// errors leave documents, chunks, indexes, and the next IDs unchanged.
     pub fn add_document(&mut self, text: impl Into<String>) -> Result<DocId, CollectionError> {
@@ -247,8 +287,23 @@ impl Collection {
         query: &str,
         options: HybridSearchOptions,
     ) -> Result<Vec<ChunkHit>, CollectionError> {
-        let query_vector = self.embedder.embed_query(query)?;
-        Ok(self.data.search(query, &query_vector, options)?)
+        let query_vector = self.embed_query(query)?;
+        self.search_with_vector(query, &query_vector, options)
+    }
+
+    /// Read-only retrieval with a precomputed query embedding. The vector must
+    /// use this collection's model and query instruction; dimensions are validated.
+    /// Blank query text errors even when limit is zero.
+    pub fn search_with_vector(
+        &self,
+        query: &str,
+        query_vector: &[f32],
+        options: HybridSearchOptions,
+    ) -> Result<Vec<ChunkHit>, CollectionError> {
+        if query.trim().is_empty() {
+            return Err(EmbeddingError::EmptyText { index: 0 }.into());
+        }
+        Ok(self.data.search(query, query_vector, options)?)
     }
 }
 

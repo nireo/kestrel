@@ -10,7 +10,7 @@ mod snapshot;
 mod vector;
 
 pub use chunking::{ChunkingConfig, ChunkingError};
-pub use collection::{Chunk, ChunkHit, ChunkId, Collection, CollectionError};
+pub use collection::{Chunk, ChunkHit, ChunkId, Collection, CollectionError, VectorSearchMode};
 pub use embeddings::{EmbeddingConfig, EmbeddingError, TextEmbedder};
 pub use hybrid::{
     HybridHit, HybridSearchOptions, hybrid_search, hybrid_search_ivf, reciprocal_rank_fusion,

@@ -32,6 +32,10 @@ fn probing_every_cluster_matches_exact_scores_ids_and_ties() {
         assert_eq!(ivf.dimensions(), source.dimensions());
         assert_eq!(ivf.cluster_count(), clusters.min(source.len()));
         assert_eq!(ivf.cluster_sizes().sum::<usize>(), source.len());
+        for id in (0..100).map(|i| 1000 - i * 7) {
+            assert_eq!(ivf.vector(id), source.vector(id));
+        }
+        assert!(ivf.vector(0).is_none());
         for query in [[1.0, 0.0, -1.0, 2.0, 3.0], [-4.0, 3.0, 2.0, 1.0, 0.0]] {
             for limit in [0, 1, 10, 100, usize::MAX] {
                 let expected = source.search(&query, limit).unwrap();
