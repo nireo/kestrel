@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
 
 /// The model and preprocessing that define this index's embedding space.
-/// Keep this configuration with stored vectors when persistence is added.
+/// Stored with persisted vectors to check embedding-space compatibility.
 /// This identifies the model, not an immutable revision of downloaded weights.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EmbeddingConfig {

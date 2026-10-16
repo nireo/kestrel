@@ -8,7 +8,7 @@ use std::ops::Range;
 use kestrel::{
     ChunkId, ChunkingConfig, ChunkingError, CollectionError, EmbeddingConfig, EmbeddingError,
     HybridSearchOptions, IvfBuildOptions, PreparedChunk, PreparedDocument, RetrievalCollection,
-    SnapshotError, VectorError, VectorSearchMode,
+    VectorError, VectorSearchMode,
 };
 
 const CONFIG: EmbeddingConfig = EmbeddingConfig {
@@ -100,10 +100,6 @@ fn malformed_prepared_documents_leave_exact_and_ivf_indexes_unchanged() {
             .search_with_vector("base", &[1.0, 0.0], HybridSearchOptions::default())
             .unwrap();
         let buffered = core.buffered_vector_count();
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("collection.kestrel");
-        core.save_snapshot(&path).unwrap();
-        let saved = std::fs::read(&path).unwrap();
         for (text, ranges) in [
             (" ", vec![0..1]),
             ("rust", vec![]),
@@ -147,85 +143,39 @@ fn malformed_prepared_documents_leave_exact_and_ivf_indexes_unchanged() {
                 .unwrap(),
             before
         );
-        core.save_snapshot(&path).unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), saved);
         assert_eq!(core.add_document(single("next", [1.0, 0.0])).unwrap(), 2);
     }
 }
 
 #[test]
-fn snapshots_restore_external_embeddings_and_buffered_writes_without_a_model() {
+fn a_bad_later_document_rejects_the_whole_batch_and_preserves_ids() {
     let mut core = collection();
-    core.add_document(single("base", [3.0, 4.0])).unwrap();
-    core.set_vector_search_mode(ivf_mode()).unwrap();
-    core.add_document(prepared(
-        "rust engine",
-        vec![0..5, 5..11],
-        vec![vec![0.0, 1.0], vec![1.0, 0.0]],
-    ))
-    .unwrap();
-    assert_eq!(core.buffered_vector_count(), 2);
-    let options = HybridSearchOptions::default();
-    let expected = core
-        .search_with_vector("engine", &[1.0, 0.0], options)
+    core.add_document(single("base", [1.0, 0.0])).unwrap();
+    let before = core
+        .search_with_vector("base", &[1.0, 0.0], HybridSearchOptions::default())
         .unwrap();
-    let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("collection.kestrel");
-    core.save_snapshot(&path).unwrap();
-    let saved = std::fs::read(&path).unwrap();
-    drop(core);
-
-    let mut restored = RetrievalCollection::load_snapshot(&path, CONFIG).unwrap();
-    assert_eq!(*restored.embedding_config(), CONFIG);
-    assert_eq!(restored.chunking_config(), ChunkingConfig::default());
-    assert_eq!(restored.vector_search_mode(), VectorSearchMode::Exact);
-    assert_eq!(restored.len(), 2);
-    assert_eq!(restored.chunk_count(), 3);
-    assert_eq!(restored.chunk_text(ChunkId(2)), Some("engine"));
-    for mode in [ivf_mode(), VectorSearchMode::Exact] {
-        restored.set_vector_search_mode(mode).unwrap();
-        restored.rebuild_vector_index().unwrap();
-        assert_eq!(
-            restored
-                .search_with_vector("engine", &[1.0, 0.0], options)
-                .unwrap(),
-            expected
-        );
-        restored.save_snapshot(&path).unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), saved);
-    }
-    assert_eq!(
-        restored.add_document(single("next", [1.0, 0.0])).unwrap(),
-        2
-    );
-    assert!(matches!(
-        RetrievalCollection::load_snapshot(
-            &path,
-            EmbeddingConfig {
-                model_id: "another-model",
-                ..CONFIG
-            },
-        ),
-        Err(CollectionError::Snapshot(
-            SnapshotError::IncompatibleEmbeddingConfig
-        ))
-    ));
-}
-
-#[test]
-fn empty_snapshots_round_trip_without_a_model() {
-    let core = collection();
-    let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("empty.kestrel");
-    core.save_snapshot(&path).unwrap();
-    let restored = RetrievalCollection::load_snapshot(&path, CONFIG).unwrap();
-    assert!(restored.is_empty());
-    assert_eq!(restored.chunk_count(), 0);
     assert!(
-        restored
-            .search_with_vector("rust", &[1.0, 0.0], HybridSearchOptions::default())
-            .unwrap()
-            .is_empty()
+        core.add_documents(vec![
+            single("valid", [0.0, 1.0]),
+            single("invalid", [0.0, 0.0])
+        ])
+        .is_err()
+    );
+    assert_eq!(core.len(), 1);
+    assert_eq!(core.chunk_count(), 1);
+    assert_eq!(
+        core.search_with_vector("base", &[1.0, 0.0], HybridSearchOptions::default())
+            .unwrap(),
+        before
+    );
+    assert!(core.add_documents(vec![]).unwrap().is_empty());
+    assert_eq!(
+        core.add_documents(vec![
+            single("first", [0.0, 1.0]),
+            single("second", [-1.0, 0.0])
+        ])
+        .unwrap(),
+        [1, 2]
     );
 }
 

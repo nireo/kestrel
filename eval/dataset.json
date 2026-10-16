@@ -74,12 +74,12 @@
       "text": "Hybrid search combines BM25 keyword matches with semantic vector matches. Reciprocal rank fusion merges the two ranked candidate lists. Combining these methods helps queries that contain both exact identifiers and paraphrased descriptions."
     },
     {
-      "id": "save-snapshot",
-      "text": "Save a search collection to a snapshot file to preserve its document text, stable IDs, and embeddings. Saving writes and syncs a temporary file before replacing the previous snapshot. Changes made later require another explicit save."
+      "id": "durable-insertion",
+      "text": "A persistent search collection preserves document text, stable IDs, and embeddings in an append-only file. Adding a document batch writes and syncs its transaction before returning success. No explicit save is needed after insertion."
     },
     {
-      "id": "restore-snapshot",
-      "text": "Load a collection snapshot after restarting the application to reopen the saved documents and vectors. Loading rebuilds the BM25 index from text and preserves document IDs. Document embeddings are restored without running embedding inference again."
+      "id": "reopen-collection",
+      "text": "Open a persistent collection after restarting the application to recover its documents and vectors. Opening streams stored batches, rebuilds the search indexes, and preserves document IDs. Document embeddings are restored without running embedding inference again."
     }
   ],
   "queries": [
@@ -126,7 +126,7 @@
     {
       "id": "collection-restart",
       "text": "How can I save my search collection and reopen it after restarting?",
-      "relevant_document_ids": ["save-snapshot", "restore-snapshot"]
+      "relevant_document_ids": ["durable-insertion", "reopen-collection"]
     },
     {
       "id": "erase-account",

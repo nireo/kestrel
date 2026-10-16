@@ -6,6 +6,27 @@
 use super::*;
 use crate::{Collection, IvfBuildOptions, IvfError};
 
+fn index_document(
+    data: &mut CollectionData,
+    text: String,
+    ranges: Vec<std::ops::Range<usize>>,
+    embeddings: Vec<Vec<f32>>,
+) -> Result<DocId, CollectionError> {
+    assert_eq!(ranges.len(), embeddings.len());
+    let document = PreparedDocument {
+        text,
+        chunks: ranges
+            .into_iter()
+            .zip(embeddings)
+            .map(|(byte_range, embedding)| PreparedChunk {
+                byte_range,
+                embedding,
+            })
+            .collect(),
+    };
+    Ok(data.insert_batch([document], true, |_| Ok(()))?.start as DocId)
+}
+
 fn ivf_mode(probes: usize) -> VectorSearchMode {
     VectorSearchMode::Ivf {
         build: IvfBuildOptions {

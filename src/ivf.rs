@@ -51,7 +51,7 @@ pub enum IvfError {
 ///
 /// Build copies normalized vectors into cluster order, preserving external IDs
 /// and float values. It owns its data; the source may be dropped after building.
-/// Updates require a rebuild. This index does not persist itself in snapshots.
+/// Updates require a rebuild. The trained index is rebuilt after reopening persistent collections.
 #[derive(Debug)]
 pub struct IvfIndex {
     dimensions: usize,

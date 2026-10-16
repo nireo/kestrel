@@ -7,7 +7,7 @@ mod embeddings;
 mod hybrid;
 mod ivf;
 mod retrieval;
-mod snapshot;
+mod storage;
 mod vector;
 
 pub use chunking::{ChunkingConfig, ChunkingError};
@@ -21,7 +21,7 @@ pub use retrieval::{
     Chunk, ChunkHit, ChunkId, PreparedChunk, PreparedDocument, RetrievalCollection,
     VectorSearchMode,
 };
-pub use snapshot::SnapshotError;
+pub use storage::{PersistentCollection, StorageError};
 pub use vector::{VectorError, VectorIndex};
 
 pub type DocId = u32;
@@ -259,8 +259,8 @@ fn tokens(normalized: &str) -> impl Iterator<Item = &str> {
         .filter(|term| !term.is_empty())
 }
 
-// Bump this when tokenization changes so snapshots cannot silently rebuild a
-// different lexical index. Independent of the snapshot's binary format version.
+// Bump this when tokenization changes so stored collections cannot silently rebuild a
+// different lexical index. Independent of the storage format version.
 const TOKENIZER_VERSION: u32 = 1;
 
 /// Shared by lexical and vector search. Reverse puts the worst retained hit at

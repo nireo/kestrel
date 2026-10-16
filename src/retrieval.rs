@@ -1,9 +1,10 @@
 use std::ops::Range;
-use std::path::Path;
+
+use serde::{Deserialize, Serialize};
 
 use crate::{
     ChunkingConfig, CollectionError, DocId, EmbeddingConfig, EmbeddingError, HybridSearchOptions,
-    IndexError, LexicalIndex, VectorError, reciprocal_rank_fusion, snapshot,
+    IndexError, LexicalIndex, VectorError, reciprocal_rank_fusion,
 };
 
 mod vectors;
@@ -49,38 +50,79 @@ impl CollectionData {
         })
     }
 
-    /// Caller validates ranges and normalized vectors. All fallible lexical
-    /// preparation happens before changing any of the document/chunk stores.
-    pub(crate) fn append_document(
+    /// Prepare every document before persistence or publication. Recovery passes
+    /// normalized vectors through unchanged to preserve their exact float bits.
+    /// Arrays and vectors share this path; returning a row range avoids an ID
+    /// vector allocation for single-document inserts.
+    pub(crate) fn insert_batch(
         &mut self,
-        text: String,
-        ranges: Vec<Range<usize>>,
-        embeddings: Vec<Vec<f32>>,
-    ) -> Result<DocId, IndexError> {
-        debug_assert!(!ranges.is_empty());
-        debug_assert_eq!(ranges.len(), embeddings.len());
-        let doc_id =
-            DocId::try_from(self.documents.len()).map_err(|_| IndexError::TooManyDocuments)?;
-        self.bm25.check_capacity(ranges.len())?;
-        let normalized: Vec<_> = ranges
+        mut documents: impl AsMut<[PreparedDocument]> + IntoIterator<Item = PreparedDocument>,
+        normalize_vectors: bool,
+        persist: impl FnOnce(&[PreparedDocument]) -> Result<(), CollectionError>,
+    ) -> Result<Range<usize>, CollectionError> {
+        let batch = documents.as_mut();
+        let start = self.documents.len();
+        let end = start
+            .checked_add(batch.len())
+            .ok_or(IndexError::TooManyDocuments)?;
+        if batch.is_empty() {
+            return Ok(start..end);
+        }
+        DocId::try_from(end - 1).map_err(|_| IndexError::TooManyDocuments)?;
+        let chunk_count = batch.iter().try_fold(0_usize, |count, doc| {
+            count
+                .checked_add(doc.chunks.len())
+                .ok_or(IndexError::TooManyDocuments)
+        })?;
+        self.bm25.check_capacity(chunk_count)?;
+        for document in &mut *batch {
+            let ranges: Vec<_> = document
+                .chunks
+                .iter()
+                .map(|chunk| chunk.byte_range.clone())
+                .collect();
+            validate_document_ranges(&document.text, &ranges)
+                .map_err(CollectionError::InvalidDocument)?;
+            for chunk in &mut document.chunks {
+                if normalize_vectors {
+                    chunk.embedding = self.vectors.normalize(&chunk.embedding)?;
+                } else {
+                    self.vectors.validate_normalized(&chunk.embedding)?;
+                }
+            }
+        }
+        let lowercase: Vec<_> = batch
             .iter()
-            .map(|range| text[range.clone()].to_lowercase())
+            .flat_map(|document| {
+                document
+                    .chunks
+                    .iter()
+                    .map(|chunk| document.text[chunk.byte_range.clone()].to_lowercase())
+            })
             .collect();
-        let prepared: Vec<_> = normalized
+        let lexical = lowercase
             .iter()
             .map(|text| LexicalIndex::prepare(text))
-            .collect::<Result<_, _>>()?;
-        for ((prepared, range), embedding) in prepared.into_iter().zip(ranges).zip(embeddings) {
-            let chunk_id = self.bm25.append(prepared);
-            debug_assert_eq!(chunk_id as usize, self.chunks.len());
-            self.vectors.append_normalized(chunk_id, &embedding);
-            self.chunks.push(Chunk {
-                doc_id,
-                byte_range: range,
-            });
+            .collect::<Result<Vec<_>, _>>()?;
+        // No fallible preparation may occur after this callback. For persistent
+        // collections it appends and syncs the transaction before publishing it.
+        persist(batch)?;
+        let mut lexical = lexical.into_iter();
+        for document in documents {
+            let doc_id = self.documents.len() as DocId;
+            for chunk in document.chunks {
+                let chunk_id = self
+                    .bm25
+                    .append(lexical.next().expect("prepared every passage"));
+                self.vectors.append_normalized(chunk_id, &chunk.embedding);
+                self.chunks.push(Chunk {
+                    doc_id,
+                    byte_range: chunk.byte_range,
+                });
+            }
+            self.documents.push(document.text);
         }
-        self.documents.push(text);
-        Ok(doc_id)
+        Ok(start..end)
     }
 
     pub(crate) fn search(
@@ -113,7 +155,7 @@ impl CollectionData {
 
 /// One externally prepared passage and its embedding. The byte range refers
 /// to the original UTF-8 text in its `PreparedDocument`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PreparedChunk {
     pub byte_range: Range<usize>,
     /// Finite, nonzero vector in the collection's embedding space. Insertion
@@ -122,7 +164,7 @@ pub struct PreparedChunk {
 }
 
 /// A source document with all passages and embeddings prepared by the caller.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PreparedDocument {
     pub text: String,
     /// Nonblank passages in strictly advancing byte-range order. Adjacent
@@ -131,17 +173,17 @@ pub struct PreparedDocument {
 }
 
 /// Model-free, append-only passage retrieval. Owns source text, BM25, vectors,
-/// and snapshot settings; never loads a model or tokenizes with a model tokenizer.
+/// and collection settings; never loads a model or tokenizes with a model tokenizer.
 /// Search accepts query vectors generated by the caller and supports shared readers.
 #[derive(Debug)]
 pub struct RetrievalCollection {
-    data: CollectionData,
+    pub(crate) data: CollectionData,
     embedding: EmbeddingConfig,
     chunking: ChunkingConfig,
 }
 
 impl RetrievalCollection {
-    /// Record the embedding space and chunking provenance for snapshot
+    /// Record the embedding space and chunking provenance for persistence
     /// compatibility. Token counts and model identity cannot be verified from
     /// supplied vectors; the caller must prepare passages using these settings.
     pub fn new(
@@ -159,12 +201,18 @@ impl RetrievalCollection {
     /// Validate all ranges and embeddings before publishing any part of a
     /// document. Returned errors leave indexes and the next IDs unchanged.
     pub fn add_document(&mut self, document: PreparedDocument) -> Result<DocId, CollectionError> {
-        let (ranges, embeddings) = document
-            .chunks
-            .into_iter()
-            .map(|chunk| (chunk.byte_range, chunk.embedding))
-            .unzip();
-        index_document(&mut self.data, document.text, ranges, embeddings)
+        let ids = self.data.insert_batch([document], true, |_| Ok(()))?;
+        Ok(ids.start as DocId)
+    }
+
+    /// Insert an entire batch atomically. Invalid documents leave all indexes
+    /// and both ID namespaces unchanged. Empty batches are a no-op.
+    pub fn add_documents(
+        &mut self,
+        documents: Vec<PreparedDocument>,
+    ) -> Result<Vec<DocId>, CollectionError> {
+        let ids = self.data.insert_batch(documents, true, |_| Ok(()))?;
+        Ok(ids.map(|id| id as DocId).collect())
     }
 
     /// Rank passages using query text for BM25 and a precomputed vector for
@@ -181,32 +229,6 @@ impl RetrievalCollection {
             return Err(EmbeddingError::EmptyText { index: 0 }.into());
         }
         Ok(self.data.search(query, query_vector, options)?)
-    }
-
-    /// Atomically save source text, passage boundaries, and every vector,
-    /// including buffered IVF writes. The parent directory must exist.
-    pub fn save_snapshot(&self, path: impl AsRef<Path>) -> Result<(), CollectionError> {
-        Ok(snapshot::save(
-            path.as_ref(),
-            &self.data,
-            &self.embedding,
-            self.chunking,
-        )?)
-    }
-
-    /// Restore without loading a model, re-chunking, or embedding. The supplied
-    /// configuration must match the snapshot's embedding space. Chunking
-    /// settings come from the snapshot; retrieval starts in exact mode.
-    pub fn load_snapshot(
-        path: impl AsRef<Path>,
-        embedding: EmbeddingConfig,
-    ) -> Result<Self, CollectionError> {
-        let (data, chunking) = snapshot::load(path.as_ref(), &embedding)?;
-        Ok(Self {
-            data,
-            embedding,
-            chunking,
-        })
     }
 
     pub fn len(&self) -> usize {
@@ -268,27 +290,7 @@ impl RetrievalCollection {
     }
 }
 
-pub(crate) fn index_document(
-    data: &mut CollectionData,
-    text: String,
-    ranges: Vec<Range<usize>>,
-    embeddings: Vec<Vec<f32>>,
-) -> Result<DocId, CollectionError> {
-    validate_document_ranges(&text, &ranges).map_err(CollectionError::InvalidDocument)?;
-    if ranges.len() != embeddings.len() {
-        return Err(CollectionError::InvalidDocument(
-            "each chunk must have exactly one embedding",
-        ));
-    }
-    let normalized: Vec<_> = embeddings
-        .iter()
-        .map(|embedding| data.vectors.normalize(embedding))
-        .collect::<Result<_, _>>()?;
-    Ok(data.append_document(text, ranges, normalized)?)
-}
-
-/// Shared by prepared ingestion and snapshot restoration. Validate before
-/// slicing source text or mutating an index.
+/// Validate before slicing source text or mutating an index.
 pub(crate) fn validate_document_ranges(
     text: &str,
     ranges: &[Range<usize>],

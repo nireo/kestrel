@@ -1,11 +1,11 @@
 use kestrel::{
     ChunkId, ChunkingConfig, Collection, CollectionError, EmbeddingError, HybridSearchOptions,
-    TextEmbedder,
+    PersistentCollection, TextEmbedder,
 };
 
 #[test]
 #[ignore = "loads the real model and downloads its files if not cached"]
-fn long_document_chunks_retrieve_the_tail_and_survive_snapshots()
+fn long_document_chunks_retrieve_the_tail_and_survive_durable_batch_recovery()
 -> Result<(), Box<dyn std::error::Error>> {
     let config = ChunkingConfig {
         max_tokens: 64,
@@ -96,25 +96,38 @@ fn long_document_chunks_retrieve_the_tail_and_survive_snapshots()
 
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("chunks.kestrel");
-    collection.save_snapshot(&path)?;
+    let mut stored = PersistentCollection::create(&path, *collection.embedding_config(), config)?;
+    let prepared = collection.prepare_documents([
+        text.clone(),
+        "Invite a coworker to join your workspace.".into(),
+    ])?;
+    assert_eq!(stored.add_documents(prepared)?, [0, 1]);
     let bytes = std::fs::read(&path)?;
     let boundaries: Vec<_> = (0..collection.chunk_count() as u32)
         .map(|id| collection.chunk(ChunkId(id)).unwrap().clone())
         .collect();
+    let query_vector = collection.embed_query(query)?;
+    let third = collection.prepare_document("A third document.")?;
+    let embedding = *collection.embedding_config();
     drop(collection);
-    let mut restored = Collection::load_snapshot(&path)?;
+    drop(stored);
+    let mut stored = PersistentCollection::open(&path, embedding)?;
+    let restored = stored.retrieval();
     assert_eq!(restored.len(), 2);
     assert_eq!(restored.chunking_config(), config);
     assert_eq!(restored.document(doc_id), Some(text.as_str()));
     for (id, chunk) in boundaries.iter().enumerate() {
         assert_eq!(restored.chunk(ChunkId(id as u32)), Some(chunk));
     }
-    assert_eq!(restored.search(query, options)?, before);
-    restored.save_snapshot(&path)?;
-    assert_eq!(std::fs::read(&path)?, bytes);
-    assert_eq!(restored.add_document("A third document.")?, 2);
     assert_eq!(
-        restored
+        restored.search_with_vector(query, &query_vector, options)?,
+        before
+    );
+    assert_eq!(std::fs::read(&path)?, bytes);
+    assert_eq!(stored.add_document(third)?, 2);
+    assert_eq!(
+        stored
+            .retrieval()
             .chunk(ChunkId(boundaries.len() as u32))
             .unwrap()
             .doc_id,

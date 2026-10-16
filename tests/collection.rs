@@ -81,7 +81,7 @@ fn collection_coordinates_real_embeddings_ids_search_and_failed_insertions()
 
 #[test]
 #[ignore = "loads the real model and downloads its files if not cached"]
-fn ivf_collection_supports_buffered_writes_shared_readers_and_snapshot_restore()
+fn ivf_collection_supports_buffered_writes_shared_readers_and_model_detachment()
 -> Result<(), Box<dyn std::error::Error>> {
     let mut collection = Collection::new()?;
     collection.add_document("Reset your password using the recovery link in your email.")?;
@@ -142,10 +142,6 @@ fn ivf_collection_supports_buffered_writes_shared_readers_and_snapshot_restore()
         ),
         Err(CollectionError::Vector(VectorError::ZeroVector))
     ));
-    let directory = tempfile::tempdir()?;
-    let path = directory.path().join("ivf-buffered.kestrel");
-    collection.save_snapshot(&path)?;
-    let saved = std::fs::read(&path)?;
     assert_eq!(
         collection
             .retrieval()
@@ -167,28 +163,12 @@ fn ivf_collection_supports_buffered_writes_shared_readers_and_snapshot_restore()
         collection.search_with_vector(query, &vector, options)?,
         expected
     );
-    collection.save_snapshot(&path)?;
-    assert_eq!(std::fs::read(&path)?, saved);
     collection.set_vector_search_mode(VectorSearchMode::Exact)?;
     assert_eq!(
         collection.search_with_vector(query, &vector, options)?,
         expected
     );
-    drop(collection);
-    let mut restored = Collection::load_snapshot(&path)?;
-    assert_eq!(restored.vector_search_mode(), VectorSearchMode::Exact);
-    assert_eq!(restored.len(), 3);
-    assert_eq!(
-        restored.search_with_vector(query, &vector, options)?,
-        expected
-    );
-    restored.set_vector_search_mode(mode)?;
-    assert_eq!(
-        restored.search_with_vector(query, &vector, options)?,
-        expected
-    );
-    assert_eq!(restored.add_document("A fourth document.")?, 3);
-    assert_eq!(restored.buffered_vector_count(), 1);
+    assert_eq!(collection.add_document("A fourth document.")?, 3);
     Ok(())
 }
 

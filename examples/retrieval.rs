@@ -1,9 +1,9 @@
-//! Model-free ingestion, snapshot restoration, and passage retrieval.
+//! Model-free ingestion, durable batch recovery, and passage retrieval.
 //! The two-dimensional vectors are hand-written for demonstration only.
 
 use kestrel::{
-    ChunkingConfig, EmbeddingConfig, HybridSearchOptions, PreparedChunk, PreparedDocument,
-    RetrievalCollection,
+    ChunkingConfig, EmbeddingConfig, HybridSearchOptions, PersistentCollection, PreparedChunk,
+    PreparedDocument,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -15,7 +15,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_tokens: 512,
         query_instruction: "",
     };
-    let mut collection = RetrievalCollection::new(config, ChunkingConfig::default())?;
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("collection.kestrel");
+    let mut collection = PersistentCollection::create(&path, config, ChunkingConfig::default())?;
+    let mut documents = Vec::new();
     for (text, embedding) in [
         ("An inverted index supports keyword search.", vec![1.0, 0.0]),
         (
@@ -23,23 +26,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             vec![0.0, 1.0],
         ),
     ] {
-        collection.add_document(PreparedDocument {
+        documents.push(PreparedDocument {
             text: text.into(),
             chunks: vec![PreparedChunk {
                 byte_range: 0..text.len(),
                 embedding,
             }],
-        })?;
+        });
     }
 
-    let directory = tempfile::tempdir()?;
-    let path = directory.path().join("collection.kestrel");
-    collection.save_snapshot(&path)?;
+    collection.add_documents(documents)?;
     drop(collection);
 
     // No embedding model is initialized or downloaded, including on restore.
-    let restored = RetrievalCollection::load_snapshot(&path, config)?;
-    let hits = restored.search_with_vector(
+    let restored = PersistentCollection::open(&path, config)?;
+    let hits = restored.retrieval().search_with_vector(
         "keyword search",
         &[1.0, 0.0],
         HybridSearchOptions::default(),
@@ -48,7 +49,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!(
             "document {}: {}",
             hit.doc_id,
-            restored.chunk_text(hit.chunk_id).unwrap(),
+            restored.retrieval().chunk_text(hit.chunk_id).unwrap(),
         );
     }
     Ok(())

@@ -1,10 +1,8 @@
-use std::path::Path;
-
 use crate::chunking::Chunker;
 use crate::{
     Chunk, ChunkHit, ChunkId, ChunkingConfig, ChunkingError, DocId, EmbeddingConfig,
     EmbeddingError, HybridSearchOptions, IndexError, IvfError, PreparedChunk, PreparedDocument,
-    RetrievalCollection, SnapshotError, TextEmbedder, VectorError, VectorSearchMode,
+    RetrievalCollection, StorageError, TextEmbedder, VectorError, VectorSearchMode,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -20,7 +18,7 @@ pub enum CollectionError {
     #[error(transparent)]
     Ivf(#[from] IvfError),
     #[error(transparent)]
-    Snapshot(#[from] SnapshotError),
+    Storage(#[from] StorageError),
     #[error("invalid prepared document: {0}")]
     InvalidDocument(&'static str),
     #[error("retrieval embedding configuration does not match the supplied embedder")]
@@ -90,33 +88,6 @@ impl Collection {
         self.retrieval
     }
 
-    /// Save all chunk vectors, including buffered IVF writes. Retrieval mode is
-    /// runtime-only; loading starts in exact mode.
-    /// Atomic replacement after writing and syncing the temporary file. The
-    /// parent directory must exist. SyncAfterReplace means the new file exists
-    /// but syncing its parent directory failed (Unix only).
-    pub fn save_snapshot(&self, path: impl AsRef<Path>) -> Result<(), CollectionError> {
-        self.retrieval.save_snapshot(path)
-    }
-
-    /// Restore stored boundaries and vectors without chunking or embedding the
-    /// documents again. Version 1 snapshots become one chunk per document.
-    /// Retrieval starts in exact mode; select IVF to train a fresh index.
-    /// This wrapper loads the local model; use `RetrievalCollection::load_snapshot`
-    /// to restore solely for precomputed-query retrieval.
-    pub fn load_snapshot(path: impl AsRef<Path>) -> Result<Self, CollectionError> {
-        let retrieval = RetrievalCollection::load_snapshot(path, EmbeddingConfig::default())?;
-        Self::from_retrieval(retrieval, TextEmbedder::new()?)
-    }
-
-    pub fn load_snapshot_with_embedder(
-        path: impl AsRef<Path>,
-        embedder: TextEmbedder,
-    ) -> Result<Self, CollectionError> {
-        let retrieval = RetrievalCollection::load_snapshot(path, *embedder.config())?;
-        Self::from_retrieval(retrieval, embedder)
-    }
-
     pub fn len(&self) -> usize {
         self.retrieval.len()
     }
@@ -177,26 +148,69 @@ impl Collection {
         Ok(self.embedder.embed_query(query)?)
     }
 
-    /// Split and embed every passage before publishing a document. Returned
-    /// errors leave documents, chunks, indexes, and the next IDs unchanged.
-    pub fn add_document(&mut self, text: impl Into<String>) -> Result<DocId, CollectionError> {
-        let text = text.into();
-        if text.trim().is_empty() {
-            return Err(EmbeddingError::EmptyText { index: 0 }.into());
+    /// Chunk and embed a document without inserting it. Prepared output can be
+    /// passed to either `RetrievalCollection` or `PersistentCollection`.
+    pub fn prepare_document(
+        &mut self,
+        text: impl Into<String>,
+    ) -> Result<PreparedDocument, CollectionError> {
+        Ok(self.prepare_documents([text])?.remove(0))
+    }
+
+    /// Prepare a batch with embedding inference shared across documents. No
+    /// collection data is changed, including when preparation fails.
+    pub fn prepare_documents<I, S>(
+        &mut self,
+        texts: I,
+    ) -> Result<Vec<PreparedDocument>, CollectionError>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let texts: Vec<String> = texts.into_iter().map(Into::into).collect();
+        let mut ranges = Vec::with_capacity(texts.len());
+        for (index, text) in texts.iter().enumerate() {
+            if text.trim().is_empty() {
+                return Err(EmbeddingError::EmptyText { index }.into());
+            }
+            ranges.push(self.chunker.ranges(text)?);
         }
-        let ranges = self.chunker.ranges(&text)?;
-        let passages: Vec<_> = ranges.iter().map(|range| &text[range.clone()]).collect();
-        let embeddings = self.embedder.embed_documents(&passages)?;
-        let chunks = ranges
-            .into_iter()
-            .zip(embeddings)
-            .map(|(byte_range, embedding)| PreparedChunk {
-                byte_range,
-                embedding,
-            })
+        let passages: Vec<_> = texts
+            .iter()
+            .zip(&ranges)
+            .flat_map(|(text, ranges)| ranges.iter().map(|range| &text[range.clone()]))
             .collect();
-        self.retrieval
-            .add_document(PreparedDocument { text, chunks })
+        let mut embeddings = self.embedder.embed_documents(&passages)?.into_iter();
+        Ok(texts
+            .into_iter()
+            .zip(ranges)
+            .map(|(text, ranges)| PreparedDocument {
+                text,
+                chunks: ranges
+                    .into_iter()
+                    .map(|byte_range| PreparedChunk {
+                        byte_range,
+                        embedding: embeddings.next().expect("embedder validated passage count"),
+                    })
+                    .collect(),
+            })
+            .collect())
+    }
+
+    /// Split and embed all passages before publishing the document.
+    pub fn add_document(&mut self, text: impl Into<String>) -> Result<DocId, CollectionError> {
+        let document = self.prepare_document(text)?;
+        self.retrieval.add_document(document)
+    }
+
+    /// Batch local chunking and embedding, then atomically insert every document.
+    pub fn add_documents<I, S>(&mut self, texts: I) -> Result<Vec<DocId>, CollectionError>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let documents = self.prepare_documents(texts)?;
+        self.retrieval.add_documents(documents)
     }
 
     /// Rank passages, including their parent document IDs. The limit counts
