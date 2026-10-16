@@ -4,7 +4,7 @@
 )]
 
 use super::*;
-use crate::{IvfBuildOptions, IvfError};
+use crate::{Collection, IvfBuildOptions, IvfError};
 
 fn ivf_mode(probes: usize) -> VectorSearchMode {
     VectorSearchMode::Ivf {

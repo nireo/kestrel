@@ -1,6 +1,7 @@
 use kestrel::{
-    Collection, CollectionError, EmbeddingError, HybridSearchOptions, IvfBuildOptions,
-    TextEmbedder, VectorError, VectorSearchMode,
+    ChunkingConfig, Collection, CollectionError, EmbeddingConfig, EmbeddingError,
+    HybridSearchOptions, IvfBuildOptions, RetrievalCollection, TextEmbedder, VectorError,
+    VectorSearchMode,
 };
 
 #[test]
@@ -145,6 +146,21 @@ fn ivf_collection_supports_buffered_writes_shared_readers_and_snapshot_restore()
     let path = directory.path().join("ivf-buffered.kestrel");
     collection.save_snapshot(&path)?;
     let saved = std::fs::read(&path)?;
+    assert_eq!(
+        collection
+            .retrieval()
+            .search_with_vector(query, &vector, options)?,
+        expected
+    );
+    let retrieval = collection.into_retrieval();
+    assert_eq!(retrieval.vector_search_mode(), mode);
+    assert_eq!(retrieval.buffered_vector_count(), 1);
+    assert_eq!(
+        retrieval.search_with_vector(query, &vector, options)?,
+        expected
+    );
+    let mut collection = Collection::from_retrieval(retrieval, TextEmbedder::new()?)?;
+    assert_eq!(collection.buffered_vector_count(), 1);
     collection.rebuild_vector_index()?;
     assert_eq!(collection.buffered_vector_count(), 0);
     assert_eq!(
@@ -173,5 +189,23 @@ fn ivf_collection_supports_buffered_writes_shared_readers_and_snapshot_restore()
     );
     assert_eq!(restored.add_document("A fourth document.")?, 3);
     assert_eq!(restored.buffered_vector_count(), 1);
+    Ok(())
+}
+
+#[test]
+#[ignore = "loads the real model and downloads its files if not cached"]
+fn attaching_an_embedder_rejects_a_different_query_instruction()
+-> Result<(), Box<dyn std::error::Error>> {
+    let retrieval = RetrievalCollection::new(
+        EmbeddingConfig {
+            query_instruction: "incompatible instruction: ",
+            ..EmbeddingConfig::default()
+        },
+        ChunkingConfig::default(),
+    )?;
+    assert!(matches!(
+        Collection::from_retrieval(retrieval, TextEmbedder::new()?),
+        Err(CollectionError::IncompatibleEmbeddingConfig)
+    ));
     Ok(())
 }

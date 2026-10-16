@@ -6,16 +6,21 @@ mod collection;
 mod embeddings;
 mod hybrid;
 mod ivf;
+mod retrieval;
 mod snapshot;
 mod vector;
 
 pub use chunking::{ChunkingConfig, ChunkingError};
-pub use collection::{Chunk, ChunkHit, ChunkId, Collection, CollectionError, VectorSearchMode};
+pub use collection::{Collection, CollectionError};
 pub use embeddings::{EmbeddingConfig, EmbeddingError, TextEmbedder};
 pub use hybrid::{
     HybridHit, HybridSearchOptions, hybrid_search, hybrid_search_ivf, reciprocal_rank_fusion,
 };
 pub use ivf::{IvfBuildOptions, IvfError, IvfIndex};
+pub use retrieval::{
+    Chunk, ChunkHit, ChunkId, PreparedChunk, PreparedDocument, RetrievalCollection,
+    VectorSearchMode,
+};
 pub use snapshot::SnapshotError;
 pub use vector::{VectorError, VectorIndex};
 

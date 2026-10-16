@@ -1,36 +1,11 @@
-use std::ops::Range;
 use std::path::Path;
 
 use crate::chunking::Chunker;
 use crate::{
-    ChunkingConfig, ChunkingError, DocId, EmbeddingConfig, EmbeddingError, HybridSearchOptions,
-    IndexError, IvfError, LexicalIndex, SnapshotError, TextEmbedder, VectorError,
-    reciprocal_rank_fusion, snapshot,
+    Chunk, ChunkHit, ChunkId, ChunkingConfig, ChunkingError, DocId, EmbeddingConfig,
+    EmbeddingError, HybridSearchOptions, IndexError, IvfError, PreparedChunk, PreparedDocument,
+    RetrievalCollection, SnapshotError, TextEmbedder, VectorError, VectorSearchMode,
 };
-
-mod vectors;
-pub(crate) use vectors::CollectionVectors;
-pub use vectors::VectorSearchMode;
-
-/// A passage ID, distinct from the ID of its source document.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ChunkId(pub u32);
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Chunk {
-    pub doc_id: DocId,
-    pub byte_range: Range<usize>,
-}
-
-/// A ranked passage. Multiple hits can belong to the same source document.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ChunkHit {
-    pub chunk_id: ChunkId,
-    pub doc_id: DocId,
-    pub score: f64,
-    pub bm25_rank: Option<usize>,
-    pub vector_rank: Option<usize>,
-}
 
 #[derive(Debug, thiserror::Error)]
 pub enum CollectionError {
@@ -46,95 +21,19 @@ pub enum CollectionError {
     Ivf(#[from] IvfError),
     #[error(transparent)]
     Snapshot(#[from] SnapshotError),
+    #[error("invalid prepared document: {0}")]
+    InvalidDocument(&'static str),
+    #[error("retrieval embedding configuration does not match the supplied embedder")]
+    IncompatibleEmbeddingConfig,
 }
 
-/// Original text is owned once; chunks reference byte ranges in that text.
-#[derive(Debug)]
-pub(crate) struct CollectionData {
-    pub(crate) documents: Vec<String>,
-    pub(crate) chunks: Vec<Chunk>,
-    pub(crate) bm25: LexicalIndex,
-    pub(crate) vectors: CollectionVectors,
-}
-
-impl CollectionData {
-    pub(crate) fn new(dimensions: usize) -> Result<Self, VectorError> {
-        Ok(Self {
-            documents: Vec::new(),
-            chunks: Vec::new(),
-            bm25: LexicalIndex::default(),
-            vectors: CollectionVectors::new(dimensions)?,
-        })
-    }
-
-    /// Caller validates ranges and normalized vectors. All fallible lexical
-    /// preparation happens before changing any of the document/chunk stores.
-    pub(crate) fn append_document(
-        &mut self,
-        text: String,
-        ranges: Vec<Range<usize>>,
-        embeddings: Vec<Vec<f32>>,
-    ) -> Result<DocId, IndexError> {
-        debug_assert!(!ranges.is_empty());
-        debug_assert_eq!(ranges.len(), embeddings.len());
-        let doc_id =
-            DocId::try_from(self.documents.len()).map_err(|_| IndexError::TooManyDocuments)?;
-        self.bm25.check_capacity(ranges.len())?;
-        let normalized: Vec<_> = ranges
-            .iter()
-            .map(|range| text[range.clone()].to_lowercase())
-            .collect();
-        let prepared: Vec<_> = normalized
-            .iter()
-            .map(|text| LexicalIndex::prepare(text))
-            .collect::<Result<_, _>>()?;
-        for ((prepared, range), embedding) in prepared.into_iter().zip(ranges).zip(embeddings) {
-            let chunk_id = self.bm25.append(prepared);
-            debug_assert_eq!(chunk_id as usize, self.chunks.len());
-            self.vectors.append_normalized(chunk_id, &embedding);
-            self.chunks.push(Chunk {
-                doc_id,
-                byte_range: range,
-            });
-        }
-        self.documents.push(text);
-        Ok(doc_id)
-    }
-
-    pub(crate) fn search(
-        &self,
-        query: &str,
-        query_vector: &[f32],
-        options: HybridSearchOptions,
-    ) -> Result<Vec<ChunkHit>, VectorError> {
-        let depth = if options.limit == 0 {
-            0
-        } else {
-            options.candidate_depth
-        };
-        let vector_hits = self.vectors.search(query_vector, depth)?;
-        let bm25_hits = self.bm25.search(query, depth);
-        Ok(
-            reciprocal_rank_fusion(&bm25_hits, &vector_hits, options.limit)
-                .into_iter()
-                .map(|hit| ChunkHit {
-                    chunk_id: ChunkId(hit.doc_id),
-                    doc_id: self.chunks[hit.doc_id as usize].doc_id,
-                    score: hit.score,
-                    bm25_rank: hit.bm25_rank,
-                    vector_rank: hit.vector_rank,
-                })
-                .collect(),
-        )
-    }
-}
-
-/// Append-only documents with token-sized searchable passages. BM25 and vector
-/// search both rank chunks; len() and document() refer to source documents.
+/// Local chunking and embedding convenience wrapper around `RetrievalCollection`.
+/// BM25 and vector search both rank chunks; len() and document() refer to source
+/// documents. Use `into_retrieval` to serve prepared queries without the model.
 pub struct Collection {
     embedder: TextEmbedder,
     chunker: Chunker,
-    data: CollectionData,
+    retrieval: RetrievalCollection,
 }
 
 impl Collection {
@@ -155,25 +54,40 @@ impl Collection {
         embedder: TextEmbedder,
         config: ChunkingConfig,
     ) -> Result<Self, CollectionError> {
-        let data = CollectionData::new(embedder.dimensions())?;
-        Self::from_data(embedder, data, config)
+        let retrieval = RetrievalCollection::new(*embedder.config(), config)?;
+        Self::from_retrieval(retrieval, embedder)
     }
 
-    fn from_data(
+    /// Attach local chunking and embedding to an existing retrieval collection.
+    /// The embedding space must match exactly; existing IDs and retrieval mode
+    /// are preserved.
+    pub fn from_retrieval(
+        retrieval: RetrievalCollection,
         embedder: TextEmbedder,
-        data: CollectionData,
-        config: ChunkingConfig,
     ) -> Result<Self, CollectionError> {
+        if retrieval.embedding_config() != embedder.config() {
+            return Err(CollectionError::IncompatibleEmbeddingConfig);
+        }
         let chunker = Chunker::new(
             embedder.tokenizer().clone(),
-            config,
+            retrieval.chunking_config(),
             embedder.config().max_tokens,
         )?;
         Ok(Self {
             embedder,
             chunker,
-            data,
+            retrieval,
         })
+    }
+
+    /// Borrow the model-free retrieval core for precomputed-query searches.
+    pub fn retrieval(&self) -> &RetrievalCollection {
+        &self.retrieval
+    }
+
+    /// Drop the local model and chunker, retaining all indexed data and settings.
+    pub fn into_retrieval(self) -> RetrievalCollection {
+        self.retrieval
     }
 
     /// Save all chunk vectors, including buffered IVF writes. Retrieval mode is
@@ -182,51 +96,47 @@ impl Collection {
     /// parent directory must exist. SyncAfterReplace means the new file exists
     /// but syncing its parent directory failed (Unix only).
     pub fn save_snapshot(&self, path: impl AsRef<Path>) -> Result<(), CollectionError> {
-        Ok(snapshot::save(
-            path.as_ref(),
-            &self.data,
-            self.embedding_config(),
-            self.chunking_config(),
-        )?)
+        self.retrieval.save_snapshot(path)
     }
 
     /// Restore stored boundaries and vectors without chunking or embedding the
     /// documents again. Version 1 snapshots become one chunk per document.
     /// Retrieval starts in exact mode; select IVF to train a fresh index.
+    /// This wrapper loads the local model; use `RetrievalCollection::load_snapshot`
+    /// to restore solely for precomputed-query retrieval.
     pub fn load_snapshot(path: impl AsRef<Path>) -> Result<Self, CollectionError> {
-        let (data, config) = snapshot::load(path.as_ref(), &crate::embeddings::CONFIG)?;
-        Self::from_data(TextEmbedder::new()?, data, config)
+        let retrieval = RetrievalCollection::load_snapshot(path, EmbeddingConfig::default())?;
+        Self::from_retrieval(retrieval, TextEmbedder::new()?)
     }
 
     pub fn load_snapshot_with_embedder(
         path: impl AsRef<Path>,
         embedder: TextEmbedder,
     ) -> Result<Self, CollectionError> {
-        let (data, config) = snapshot::load(path.as_ref(), embedder.config())?;
-        Self::from_data(embedder, data, config)
+        let retrieval = RetrievalCollection::load_snapshot(path, *embedder.config())?;
+        Self::from_retrieval(retrieval, embedder)
     }
 
     pub fn len(&self) -> usize {
-        self.data.documents.len()
+        self.retrieval.len()
     }
     pub fn is_empty(&self) -> bool {
-        self.data.documents.is_empty()
+        self.retrieval.is_empty()
     }
     pub fn chunk_count(&self) -> usize {
-        self.data.chunks.len()
+        self.retrieval.chunk_count()
     }
 
     pub fn document(&self, doc_id: DocId) -> Option<&str> {
-        self.data.documents.get(doc_id as usize).map(String::as_str)
+        self.retrieval.document(doc_id)
     }
 
     pub fn chunk(&self, chunk_id: ChunkId) -> Option<&Chunk> {
-        self.data.chunks.get(chunk_id.0 as usize)
+        self.retrieval.chunk(chunk_id)
     }
 
     pub fn chunk_text(&self, chunk_id: ChunkId) -> Option<&str> {
-        let chunk = self.chunk(chunk_id)?;
-        self.document(chunk.doc_id)?.get(chunk.byte_range.clone())
+        self.retrieval.chunk_text(chunk_id)
     }
 
     pub fn embedding_config(&self) -> &'static EmbeddingConfig {
@@ -243,23 +153,23 @@ impl Collection {
         &mut self,
         mode: VectorSearchMode,
     ) -> Result<(), CollectionError> {
-        Ok(self.data.vectors.set_mode(mode)?)
+        self.retrieval.set_vector_search_mode(mode)
     }
 
     pub fn vector_search_mode(&self) -> VectorSearchMode {
-        self.data.vectors.mode()
+        self.retrieval.vector_search_mode()
     }
 
     /// Number of newly inserted chunk vectors awaiting an explicit IVF rebuild.
     /// They are already searchable through the exact insertion buffer.
     pub fn buffered_vector_count(&self) -> usize {
-        self.data.vectors.buffered_vector_count()
+        self.retrieval.buffered_vector_count()
     }
 
     /// Retrain IVF over all chunks and empty its insertion buffer after success.
     /// This synchronous operation needs exclusive access; exact mode is a no-op.
     pub fn rebuild_vector_index(&mut self) -> Result<(), CollectionError> {
-        Ok(self.data.vectors.rebuild()?)
+        self.retrieval.rebuild_vector_index()
     }
 
     /// Prepare a query with the collection's embedding model and instruction.
@@ -277,7 +187,16 @@ impl Collection {
         let ranges = self.chunker.ranges(&text)?;
         let passages: Vec<_> = ranges.iter().map(|range| &text[range.clone()]).collect();
         let embeddings = self.embedder.embed_documents(&passages)?;
-        index_document(&mut self.data, text, ranges, embeddings)
+        let chunks = ranges
+            .into_iter()
+            .zip(embeddings)
+            .map(|(byte_range, embedding)| PreparedChunk {
+                byte_range,
+                embedding,
+            })
+            .collect();
+        self.retrieval
+            .add_document(PreparedDocument { text, chunks })
     }
 
     /// Rank passages, including their parent document IDs. The limit counts
@@ -300,25 +219,7 @@ impl Collection {
         query_vector: &[f32],
         options: HybridSearchOptions,
     ) -> Result<Vec<ChunkHit>, CollectionError> {
-        if query.trim().is_empty() {
-            return Err(EmbeddingError::EmptyText { index: 0 }.into());
-        }
-        Ok(self.data.search(query, query_vector, options)?)
+        self.retrieval
+            .search_with_vector(query, query_vector, options)
     }
 }
-
-fn index_document(
-    data: &mut CollectionData,
-    text: String,
-    ranges: Vec<Range<usize>>,
-    embeddings: Vec<Vec<f32>>,
-) -> Result<DocId, CollectionError> {
-    let normalized: Vec<_> = embeddings
-        .iter()
-        .map(|embedding| data.vectors.normalize(embedding))
-        .collect::<Result<_, _>>()?;
-    Ok(data.append_document(text, ranges, normalized)?)
-}
-
-#[cfg(test)]
-mod tests;

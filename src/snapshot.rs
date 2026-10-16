@@ -10,7 +10,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::collection::CollectionData;
+use crate::retrieval::{CollectionData, validate_document_ranges};
 use crate::{
     ChunkId, ChunkingConfig, ChunkingError, DocId, EmbeddingConfig, IndexError, TOKENIZER_VERSION,
     VectorError,
@@ -253,27 +253,6 @@ fn decode(
         {
             let chunk = chunks.next().unwrap();
             let range = chunk.start..chunk.end;
-            if chunk.start >= chunk.end
-                || text
-                    .get(range.clone())
-                    .is_none_or(|passage| passage.trim().is_empty())
-            {
-                return Err(SnapshotError::InvalidData("invalid chunk byte range"));
-            }
-            if let Some(previous) = ranges.last() {
-                if range.start <= previous.start
-                    || range.end <= previous.end
-                    || range.start > previous.end
-                {
-                    return Err(SnapshotError::InvalidData(
-                        "chunks do not cover document in order",
-                    ));
-                }
-            } else if range.start != 0 {
-                return Err(SnapshotError::InvalidData(
-                    "first chunk does not start at zero",
-                ));
-            }
             let chunk_id = ChunkId((data.chunks.len() + ranges.len()) as u32);
             data.vectors
                 .validate_normalized(&chunk.embedding)
@@ -281,11 +260,7 @@ fn decode(
             ranges.push(range);
             embeddings.push(chunk.embedding);
         }
-        if ranges.last().is_none_or(|range| range.end != text.len()) {
-            return Err(SnapshotError::InvalidData(
-                "chunks do not cover entire document",
-            ));
-        }
+        validate_document_ranges(&text, &ranges).map_err(SnapshotError::InvalidData)?;
         data.append_document(text, ranges, embeddings)?;
     }
     if chunks.next().is_some() {

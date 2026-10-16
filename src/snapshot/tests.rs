@@ -461,12 +461,12 @@ fn save_rejects_missing_vectors_and_mismatched_dimensions_before_replacement() {
     for id in 1..=data.chunks.len() as u32 {
         wrong_ids.insert(id, &[1.0, 0.0, 0.0]).unwrap();
     }
-    data.vectors = crate::collection::CollectionVectors::Exact(wrong_ids);
+    data.vectors = crate::retrieval::CollectionVectors::Exact(wrong_ids);
     assert!(matches!(
         save(&path, &data, &CONFIG, CHUNKING),
         Err(SnapshotError::InvalidData("chunk has no vector"))
     ));
-    data.vectors = crate::collection::CollectionVectors::Exact(VectorIndex::new(2).unwrap());
+    data.vectors = crate::retrieval::CollectionVectors::Exact(VectorIndex::new(2).unwrap());
     assert!(save(&path, &data, &CONFIG, CHUNKING).is_err());
     assert_eq!(fs::read(&path).unwrap(), before);
     assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);

@@ -25,6 +25,14 @@ pub(crate) const CONFIG: EmbeddingConfig = EmbeddingConfig {
     query_instruction: "Represent this sentence for searching relevant passages: ",
 };
 
+impl Default for EmbeddingConfig {
+    /// The English BGE configuration used by `TextEmbedder` and `Collection`.
+    /// Reading these settings does not load or download a model.
+    fn default() -> Self {
+        CONFIG
+    }
+}
+
 const DOCUMENT_BATCH_SIZE: usize = 32;
 
 #[derive(Debug, thiserror::Error)]
