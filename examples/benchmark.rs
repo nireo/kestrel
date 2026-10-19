@@ -13,7 +13,10 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use kestrel::{HybridSearchOptions, InvertedIndex, VectorIndex, hybrid_search};
+use kestrel::{
+    Bm25Scratch, HybridSearchOptions, InvertedIndex, VectorIndex, hybrid_search,
+    reciprocal_rank_fusion,
+};
 use serde::Serialize;
 
 use data::{Document, Error, Fingerprint, Header};
@@ -179,8 +182,10 @@ struct Run {
     peak_rss_after_build_bytes: Option<u64>,
     peak_rss_after_queries_bytes: Option<u64>,
     bm25: Timing,
+    bm25_scratch: Timing,
     vector: Timing,
     hybrid: Timing,
+    hybrid_scratch: Timing,
     /// Entry i is the exact vector top-k for dataset.queries[i]. IDs are row numbers.
     exact_neighbors: Vec<Vec<Neighbor>>,
     ivf: Option<ivf::IvfReport>,
@@ -335,6 +340,15 @@ fn run(config: &Config, count: usize) -> Result<Run, Error> {
         |_, _| {},
     )?;
     print_timing("BM25", &bm25_timing);
+    let mut scratch = Bm25Scratch::default();
+    let bm25_scratch = measure::measure(
+        &header.queries,
+        config.warmup,
+        config.rounds,
+        |q| Ok(bm25.search_with_scratch(&q.text, config.limit, &mut scratch)),
+        |_, _| {},
+    )?;
+    print_timing("BM25/reuse", &bm25_scratch);
     let mut exact_neighbors: Vec<Vec<Neighbor>> =
         (0..header.queries.len()).map(|_| Vec::new()).collect();
     let vector_timing = measure::measure(
@@ -365,6 +379,23 @@ fn run(config: &Config, count: usize) -> Result<Run, Error> {
         |_, _| {},
     )?;
     print_timing("Hybrid", &hybrid_timing);
+    let hybrid_scratch = measure::measure(
+        &header.queries,
+        config.warmup,
+        config.rounds,
+        |q| {
+            let vector_hits = vectors.search(&q.vector, options.candidate_depth)?;
+            let bm25_hits =
+                bm25.search_with_scratch(&q.text, options.candidate_depth, &mut scratch);
+            Ok(reciprocal_rank_fusion(
+                &bm25_hits,
+                &vector_hits,
+                options.limit,
+            ))
+        },
+        |_, _| {},
+    )?;
+    print_timing("Hybrid/reuse", &hybrid_scratch);
     let peak_rss_after_queries_bytes = peak_rss_bytes();
     let ivf = ivf::run(config, &bm25, &vectors, &header, &exact_neighbors)?;
     Ok(Run {
@@ -380,8 +411,10 @@ fn run(config: &Config, count: usize) -> Result<Run, Error> {
         peak_rss_after_build_bytes,
         peak_rss_after_queries_bytes,
         bm25: bm25_timing,
+        bm25_scratch,
         vector: vector_timing,
         hybrid: hybrid_timing,
+        hybrid_scratch,
         exact_neighbors,
         ivf,
     })
@@ -500,7 +533,13 @@ mod tests {
                 expected.iter().map(|h| h.doc_id).collect::<Vec<_>>()
             );
         }
-        for timing in [&result.bm25, &result.vector, &result.hybrid] {
+        for timing in [
+            &result.bm25,
+            &result.bm25_scratch,
+            &result.vector,
+            &result.hybrid,
+            &result.hybrid_scratch,
+        ] {
             assert_eq!(timing.samples, 8);
             assert_eq!(timing.query_indices.len(), 8);
             for index in 0..4 {

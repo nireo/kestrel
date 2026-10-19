@@ -199,6 +199,7 @@ fn inverted_search_and_top_k_agree_with_an_independent_full_scan() {
         .collect();
     let documents: Vec<&str> = documents.iter().map(String::as_str).collect();
     let index = index_documents(&documents);
+    let mut scratch = kestrel::Bm25Scratch::default();
 
     for query in [
         "rust",
@@ -209,6 +210,10 @@ fn inverted_search_and_top_k_agree_with_an_independent_full_scan() {
     ] {
         for limit in [0, 1, 3, 10, 100, usize::MAX] {
             let actual = index.search(query, limit);
+            assert_eq!(
+                actual,
+                index.search_with_scratch(query, limit, &mut scratch)
+            );
             let expected = full_scan(&documents, query, limit);
             assert_eq!(actual.len(), expected.len(), "{query}, limit {limit}");
             for (actual, expected) in actual.iter().zip(expected) {
@@ -217,4 +222,37 @@ fn inverted_search_and_top_k_agree_with_an_independent_full_scan() {
             }
         }
     }
+}
+
+#[test]
+fn scratch_resets_across_indexes_growth_zero_limits_and_unicode_queries() {
+    let mut index = index_documents(&["Café ΟΣ rust", "rust search", ""]);
+    let mut scratch = kestrel::Bm25Scratch::default();
+    let many_terms = (0..80)
+        .map(|i| format!("term{i}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    index.add_document(&many_terms).unwrap();
+    assert_eq!(
+        index.search(&many_terms, 10),
+        index.search(&format!("{many_terms} {many_terms}"), 10)
+    );
+    for query in ["RUST rust", "CAFÉ ΟΣ", "missing", "", &many_terms, "rust"] {
+        for limit in [0, 1, usize::MAX] {
+            assert_eq!(
+                index.search(query, limit),
+                index.search_with_scratch(query, limit, &mut scratch)
+            );
+        }
+    }
+    let smaller = index_documents(&["search", "Café"]);
+    assert_eq!(
+        smaller.search("search", 10),
+        smaller.search_with_scratch("search", 10, &mut scratch)
+    );
+    index.add_document("search rust").unwrap();
+    assert_eq!(
+        index.search("search", 10),
+        index.search_with_scratch("search", 10, &mut scratch)
+    );
 }

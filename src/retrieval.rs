@@ -3,8 +3,8 @@ use std::ops::Range;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ChunkingConfig, CollectionError, DocId, EmbeddingConfig, EmbeddingError, HybridSearchOptions,
-    IndexError, LexicalIndex, VectorError, reciprocal_rank_fusion,
+    Bm25Scratch, ChunkingConfig, CollectionError, DocId, EmbeddingConfig, EmbeddingError,
+    HybridSearchOptions, IndexError, LexicalIndex, VectorError, reciprocal_rank_fusion,
 };
 
 mod vectors;
@@ -131,13 +131,26 @@ impl CollectionData {
         query_vector: &[f32],
         options: HybridSearchOptions,
     ) -> Result<Vec<ChunkHit>, VectorError> {
+        self.search_with_scratch(query, query_vector, options, None)
+    }
+
+    fn search_with_scratch(
+        &self,
+        query: &str,
+        query_vector: &[f32],
+        options: HybridSearchOptions,
+        scratch: Option<&mut Bm25Scratch>,
+    ) -> Result<Vec<ChunkHit>, VectorError> {
         let depth = if options.limit == 0 {
             0
         } else {
             options.candidate_depth
         };
         let vector_hits = self.vectors.search(query_vector, depth)?;
-        let bm25_hits = self.bm25.search(query, depth);
+        let bm25_hits = match scratch {
+            Some(scratch) => self.bm25.search_with_scratch(query, depth, scratch),
+            None => self.bm25.search(query, depth),
+        };
         Ok(
             reciprocal_rank_fusion(&bm25_hits, &vector_hits, options.limit)
                 .into_iter()
@@ -229,6 +242,24 @@ impl RetrievalCollection {
             return Err(EmbeddingError::EmptyText { index: 0 }.into());
         }
         Ok(self.data.search(query, query_vector, options)?)
+    }
+
+    /// Read-only retrieval with reusable BM25 score storage. Keep one workspace
+    /// per reader to avoid per-match hashing without serializing shared reads.
+    /// Validation and ranking match `search_with_vector`.
+    pub fn search_with_vector_and_scratch(
+        &self,
+        query: &str,
+        query_vector: &[f32],
+        options: HybridSearchOptions,
+        scratch: &mut Bm25Scratch,
+    ) -> Result<Vec<ChunkHit>, CollectionError> {
+        if query.trim().is_empty() {
+            return Err(EmbeddingError::EmptyText { index: 0 }.into());
+        }
+        Ok(self
+            .data
+            .search_with_scratch(query, query_vector, options, Some(scratch))?)
     }
 
     pub fn len(&self) -> usize {

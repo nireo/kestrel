@@ -29,8 +29,9 @@ pub struct VectorIndex {
     // Row i occupies vectors[i * dimensions .. (i + 1) * dimensions].
     vectors: Vec<f32>,
     doc_ids: Vec<DocId>,
-    // Map an external document ID to its row, without requiring dense IDs.
-    positions: HashMap<DocId, usize>,
+    // Consecutive IDs (including IVF insertion buffers) need no lookup table.
+    // Lazily fall back to a map when callers supply sparse or unordered IDs.
+    positions: Option<HashMap<DocId, usize>>,
 }
 
 impl VectorIndex {
@@ -43,7 +44,7 @@ impl VectorIndex {
             dimensions,
             vectors: Vec::new(),
             doc_ids: Vec::new(),
-            positions: HashMap::new(),
+            positions: None,
         })
     }
 
@@ -62,7 +63,7 @@ impl VectorIndex {
     /// Normalize and append a vector for an existing document ID.
     /// Validation errors leave the index unchanged; the input is not modified.
     pub fn insert(&mut self, doc_id: DocId, vector: &[f32]) -> Result<(), VectorError> {
-        if self.positions.contains_key(&doc_id) {
+        if self.position(doc_id).is_some() {
             return Err(VectorError::DuplicateDocument { doc_id });
         }
         let normalized = self.normalize(vector)?;
@@ -74,20 +75,45 @@ impl VectorIndex {
     /// the document ID is unused before reaching this point.
     pub(crate) fn append_normalized(&mut self, doc_id: DocId, normalized: &[f32]) {
         debug_assert_eq!(normalized.len(), self.dimensions);
-        debug_assert!(!self.positions.contains_key(&doc_id));
+        debug_assert!(self.position(doc_id).is_none());
         let row = self.len();
+
+        if self.positions.is_none()
+            && self
+                .doc_ids
+                .first()
+                .is_some_and(|&first| u64::from(doc_id) != u64::from(first) + row as u64)
+        {
+            self.positions = Some(
+                self.doc_ids
+                    .iter()
+                    .enumerate()
+                    .map(|(row, &id)| (id, row))
+                    .collect(),
+            );
+        }
 
         self.vectors.extend_from_slice(normalized);
         self.doc_ids.push(doc_id);
-        self.positions.insert(doc_id, row);
+        if let Some(positions) = &mut self.positions {
+            positions.insert(doc_id, row);
+        }
     }
 
     /// Borrow the stored, normalized vector for a document.
     pub fn vector(&self, doc_id: DocId) -> Option<&[f32]> {
-        let row = *self.positions.get(&doc_id)?;
+        let row = self.position(doc_id)?;
         let start = row * self.dimensions;
 
         Some(&self.vectors[start..start + self.dimensions])
+    }
+
+    fn position(&self, doc_id: DocId) -> Option<usize> {
+        if let Some(positions) = &self.positions {
+            return positions.get(&doc_id).copied();
+        }
+        let row = doc_id.checked_sub(*self.doc_ids.first()?)? as usize;
+        (row < self.len()).then_some(row)
     }
 
     /// Compare the query against every stored vector and return the best hits.
@@ -134,10 +160,24 @@ impl VectorIndex {
 }
 
 pub(crate) fn dot(a: &[f32], b: &[f32]) -> f64 {
-    a.iter()
-        .zip(b)
+    // Independent lanes break the serial accumulation dependency and allow
+    // auto-vectorization. Promote before multiplying to retain f64 precision.
+    debug_assert_eq!(a.len(), b.len());
+    let mut sums = [0.0_f64; 4];
+    let mut a_chunks = a.chunks_exact(4);
+    let mut b_chunks = b.chunks_exact(4);
+    for (a, b) in a_chunks.by_ref().zip(b_chunks.by_ref()) {
+        for lane in 0..4 {
+            sums[lane] += f64::from(a[lane]) * f64::from(b[lane]);
+        }
+    }
+    let tail: f64 = a_chunks
+        .remainder()
+        .iter()
+        .zip(b_chunks.remainder())
         .map(|(&a, &b)| f64::from(a) * f64::from(b))
-        .sum()
+        .sum();
+    sums.into_iter().sum::<f64>() + tail
 }
 
 pub(crate) fn normalize(vector: &[f32], dimensions: usize) -> Result<Vec<f32>, VectorError> {

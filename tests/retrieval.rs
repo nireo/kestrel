@@ -90,6 +90,52 @@ fn external_embeddings_rank_passages_and_preserve_source_text() {
 }
 
 #[test]
+fn reusable_search_matches_exact_and_ivf_after_errors_and_buffered_writes() {
+    let mut core = collection();
+    let mut scratch = kestrel::Bm25Scratch::default();
+    core.add_document(single("rust engine", [1.0, 0.0]))
+        .unwrap();
+    for mode in [VectorSearchMode::Exact, ivf_mode()] {
+        core.set_vector_search_mode(mode).unwrap();
+        core.add_document(single("fresh rust", [0.0, 1.0])).unwrap();
+        for limit in [0, 1, 10] {
+            let options = HybridSearchOptions {
+                limit,
+                candidate_depth: 10,
+            };
+            for query in ["RUST rust", "fresh", "missing"] {
+                assert_eq!(
+                    core.search_with_vector(query, &[1.0, 0.0], options)
+                        .unwrap(),
+                    core.search_with_vector_and_scratch(query, &[1.0, 0.0], options, &mut scratch)
+                        .unwrap()
+                );
+                assert!(
+                    core.search_with_vector_and_scratch(query, &[0.0, 0.0], options, &mut scratch)
+                        .is_err()
+                );
+            }
+            assert!(
+                core.search_with_vector_and_scratch(" ", &[1.0, 0.0], options, &mut scratch)
+                    .is_err()
+            );
+        }
+        core.rebuild_vector_index().unwrap();
+        assert_eq!(
+            core.search_with_vector("fresh", &[0.0, 1.0], HybridSearchOptions::default())
+                .unwrap(),
+            core.search_with_vector_and_scratch(
+                "fresh",
+                &[0.0, 1.0],
+                HybridSearchOptions::default(),
+                &mut scratch
+            )
+            .unwrap()
+        );
+    }
+}
+
+#[test]
 fn malformed_prepared_documents_leave_exact_and_ivf_indexes_unchanged() {
     for mode in [VectorSearchMode::Exact, ivf_mode()] {
         let mut core = collection();

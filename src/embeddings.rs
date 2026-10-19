@@ -33,7 +33,7 @@ impl Default for EmbeddingConfig {
     }
 }
 
-const DOCUMENT_BATCH_SIZE: usize = 32;
+const EMBEDDING_BATCH_SIZE: usize = 32;
 
 #[derive(Debug, thiserror::Error)]
 pub enum EmbeddingError {
@@ -108,7 +108,7 @@ impl TextEmbedder {
         // Pool one batch before running the next: FastEmbed retains the raw
         // token-level outputs of each batch in a single embed() call.
         let mut vectors = Vec::with_capacity(texts.len());
-        for batch in texts.chunks(DOCUMENT_BATCH_SIZE) {
+        for batch in texts.chunks(EMBEDDING_BATCH_SIZE) {
             let batch_vectors = self.model.embed(batch, None)?;
             validate_output(&batch_vectors, batch.len())?;
             vectors.extend(batch_vectors);
@@ -124,6 +124,24 @@ impl TextEmbedder {
         let mut vectors = self.model.embed([input], None)?;
         validate_output(&vectors, 1)?;
         Ok(vectors.remove(0))
+    }
+
+    /// Embed queries in bounded batches with BGE's retrieval instruction.
+    /// Preserves input order. Validates all inputs before running inference;
+    /// empty batches return no vectors and blank texts report their input index.
+    pub fn embed_queries(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        validate_texts(texts)?;
+        let mut vectors = Vec::with_capacity(texts.len());
+        for batch in texts.chunks(EMBEDDING_BATCH_SIZE) {
+            let inputs: Vec<_> = batch
+                .iter()
+                .map(|text| format!("{}{text}", CONFIG.query_instruction))
+                .collect();
+            let batch_vectors = self.model.embed(inputs, None)?;
+            validate_output(&batch_vectors, batch.len())?;
+            vectors.extend(batch_vectors);
+        }
+        Ok(vectors)
     }
 }
 

@@ -12,6 +12,11 @@ fn real_embeddings_support_batching_validation_and_semantic_search()
     assert_eq!(embedder.dimensions(), 384);
     assert_eq!(embedder.config().max_tokens, 512);
     assert!(embedder.embed_documents(&[])?.is_empty());
+    assert!(embedder.embed_queries(&[])?.is_empty());
+    assert!(matches!(
+        embedder.embed_queries(&["valid", " \t"]),
+        Err(EmbeddingError::EmptyText { index: 1 })
+    ));
     assert!(matches!(
         embedder.embed_documents(&["valid", " \n\t"]),
         Err(EmbeddingError::EmptyText { index: 1 })
@@ -56,6 +61,21 @@ fn real_embeddings_support_batching_validation_and_semantic_search()
             .map(|(a, b)| (a - b).abs())
             .fold(0.0_f32, f32::max);
         assert!(max_error < 1e-4, "embedding order changed at row {index}");
+    }
+
+    let query_batches = embedder.embed_queries(&repeated)?;
+    assert_eq!(query_batches.len(), repeated.len());
+    for index in [0, 31, 32, 34] {
+        let single = embedder.embed_query(repeated[index])?;
+        let max_error = query_batches[index]
+            .iter()
+            .zip(&single)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            max_error < 1e-4,
+            "query batching changed row {index}: {max_error}"
+        );
     }
 
     let mut bm25 = InvertedIndex::new();

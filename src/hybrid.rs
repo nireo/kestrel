@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use crate::{DocId, InvertedIndex, IvfError, IvfIndex, SearchHit, VectorError, VectorIndex, top_k};
 
 const RRF_K: f64 = 60.0;
@@ -41,7 +39,7 @@ impl Default for HybridSearchOptions {
 /// Results are unique, sorted by descending fused score and then ascending ID.
 ///
 /// If C candidates are supplied and U IDs are unique, expected work is
-/// O(C + U log(k + 1) + k log(k + 1)), with O(U + k) scratch space and k capped at U.
+/// O(C log(C + 1) + U log(k + 1)), with O(C + k) scratch space and k capped at U.
 pub fn reciprocal_rank_fusion(
     bm25_hits: &[SearchHit],
     vector_hits: &[SearchHit],
@@ -51,41 +49,50 @@ pub fn reciprocal_rank_fusion(
         return Vec::new();
     }
 
-    let mut candidates = HashMap::<DocId, HybridHit>::new();
+    let mut candidates = Vec::with_capacity(bm25_hits.len() + vector_hits.len());
     for (hits, is_bm25) in [(bm25_hits, true), (vector_hits, false)] {
         for (position, hit) in hits.iter().enumerate() {
-            let candidate = candidates.entry(hit.doc_id).or_insert(HybridHit {
+            let rank = position + 1;
+            candidates.push(HybridHit {
                 doc_id: hit.doc_id,
                 score: 0.0,
-                bm25_rank: None,
-                vector_rank: None,
+                bm25_rank: is_bm25.then_some(rank),
+                vector_rank: (!is_bm25).then_some(rank),
             });
-
-            let source_rank = if is_bm25 {
-                &mut candidate.bm25_rank
-            } else {
-                &mut candidate.vector_rank
-            };
-
-            if source_rank.is_none() {
-                let rank = position + 1;
-                *source_rank = Some(rank);
-                candidate.score += 1.0 / (RRF_K + rank as f64);
+        }
+    }
+    candidates.sort_unstable_by_key(|hit| hit.doc_id);
+    candidates.dedup_by(|later, first| {
+        if later.doc_id != first.doc_id {
+            return false;
+        }
+        for (rank, other) in [
+            (&mut first.bm25_rank, later.bm25_rank),
+            (&mut first.vector_rank, later.vector_rank),
+        ] {
+            if let Some(other) = other {
+                *rank = Some(rank.map_or(other, |rank| rank.min(other)));
             }
+        }
+        true
+    });
+    for hit in &mut candidates {
+        for rank in [hit.bm25_rank, hit.vector_rank].into_iter().flatten() {
+            hit.score += 1.0 / (RRF_K + rank as f64);
         }
     }
 
-    // Reuse the same bounded heap and tie ordering as the individual searches.
+    // Candidates are in ID order, so their row numbers preserve ID tie order.
     let best = top_k(
-        candidates.values().map(|hit| SearchHit {
-            doc_id: hit.doc_id,
+        candidates.iter().enumerate().map(|(row, hit)| SearchHit {
+            doc_id: row as DocId,
             score: hit.score,
         }),
         limit,
     );
 
     best.into_iter()
-        .map(|hit| candidates[&hit.doc_id])
+        .map(|hit| candidates[hit.doc_id as usize])
         .collect()
 }
 

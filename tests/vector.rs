@@ -44,6 +44,32 @@ fn insertion_stores_a_unit_vector_without_changing_the_input() {
 }
 
 #[test]
+fn consecutive_ids_fall_back_to_sparse_lookup_without_changing_rows() {
+    for first in [0, 42, u32::MAX - 2] {
+        let mut index = VectorIndex::new(2).unwrap();
+        for offset in 0..3 {
+            index.insert(first + offset, &[offset as f32, 1.0]).unwrap();
+        }
+        let stored: Vec<_> = (0..3)
+            .map(|offset| index.vector(first + offset).unwrap().to_vec())
+            .collect();
+        assert!(index.vector(first.wrapping_sub(1)).is_none());
+        assert!(index.vector(first.wrapping_add(3)).is_none());
+        let sparse_id = if first == 0 { u32::MAX } else { 0 };
+        index.insert(sparse_id, &[1.0, 0.0]).unwrap();
+        for (offset, vector) in stored.iter().enumerate() {
+            let id = first + offset as u32;
+            assert_eq!(index.vector(id), Some(vector.as_slice()));
+            assert_eq!(
+                index.insert(id, &[0.0, 1.0]),
+                Err(VectorError::DuplicateDocument { doc_id: id })
+            );
+        }
+        assert_eq!(index.vector(sparse_id), Some([1.0, 0.0].as_slice()));
+    }
+}
+
+#[test]
 fn positive_scaling_of_documents_and_queries_does_not_change_ranking() {
     let mut index = VectorIndex::new(2).unwrap();
     index.insert(9, &[3.0, 4.0]).unwrap();
@@ -217,6 +243,49 @@ fn exact_top_k_agrees_with_direct_cosine_and_a_full_sort() {
                 assert_eq!(actual.doc_id, expected.doc_id);
                 assert_close(actual.score, expected.score);
             }
+        }
+    }
+}
+
+#[test]
+fn unrolled_dot_matches_scalar_reference_across_lanes_and_tails() {
+    for dimensions in [1, 2, 3, 4, 5, 7, 8, 9, 63, 384, 385, 768] {
+        let query: Vec<_> = (0..dimensions)
+            .map(|i| ((i * 31 % 101) as f32 - 50.0) / 50.0)
+            .collect();
+        let mut index = VectorIndex::new(dimensions).unwrap();
+        for row in 0..40 {
+            let vector: Vec<_> = (0..dimensions)
+                .map(|i| ((row * 17 + i * 13 % 97) as f32 - 48.0) / 48.0)
+                .collect();
+            index.insert(row as u32, &vector).unwrap();
+        }
+        let hits = index.search(&query, 40).unwrap();
+        // Use stored values so this specifically checks dot-product arithmetic,
+        // independently of rounding in normalization during insertion.
+        let mut query_index = VectorIndex::new(dimensions).unwrap();
+        query_index.insert(0, &query).unwrap();
+        let query = query_index.vector(0).unwrap();
+        let mut reference: Vec<_> = (0..40)
+            .map(|doc_id| SearchHit {
+                doc_id,
+                score: index
+                    .vector(doc_id)
+                    .unwrap()
+                    .iter()
+                    .zip(query)
+                    .map(|(&a, &b)| f64::from(a) * f64::from(b))
+                    .sum::<f64>()
+                    .clamp(-1.0, 1.0),
+            })
+            .collect();
+        reference.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.doc_id.cmp(&b.doc_id)));
+        for (actual, expected) in hits.iter().zip(reference) {
+            assert_eq!(actual.doc_id, expected.doc_id, "dimensions {dimensions}");
+            assert!(
+                (actual.score - expected.score).abs() < 1e-14,
+                "dimensions {dimensions}"
+            );
         }
     }
 }

@@ -45,6 +45,19 @@ fn collection_coordinates_real_embeddings_ids_search_and_failed_insertions()
     assert_eq!(before.len(), 2);
     assert_eq!(before[0].doc_id, first);
     assert_eq!(before[0].vector_rank, Some(1));
+    assert!(collection.search_many(&[], options)?.is_empty());
+    assert!(matches!(
+        collection.search_many(&[query, " \t"], options),
+        Err(CollectionError::Embedding(EmbeddingError::EmptyText {
+            index: 1
+        }))
+    ));
+    let queries = [query, "How do I cook pasta?"];
+    let batched = collection.search_many(&queries, options)?;
+    for (query, hits) in queries.iter().zip(batched) {
+        let single = collection.search(query, options)?;
+        assert_eq!(hits, single);
+    }
     assert!(matches!(
         collection.add_document(""),
         Err(CollectionError::Embedding(EmbeddingError::EmptyText {

@@ -92,18 +92,24 @@ fn main() -> Result<(), Error> {
     let start = Instant::now();
     let mut embedder = TextEmbedder::new()?;
     let model_load = start.elapsed();
-    let mut queries = Vec::with_capacity(input.queries.len());
-    let mut query_times = Vec::with_capacity(input.queries.len());
-    for query in input.queries {
-        let start = Instant::now();
-        let vector = embedder.embed_query(&query.text)?;
-        query_times.push(start.elapsed().as_secs_f64() * 1000.0);
-        queries.push(Query {
+    let texts: Vec<_> = input
+        .queries
+        .iter()
+        .map(|query| query.text.as_str())
+        .collect();
+    let start = Instant::now();
+    let vectors = embedder.embed_queries(&texts)?;
+    let query_time = start.elapsed();
+    let queries = input
+        .queries
+        .into_iter()
+        .zip(vectors)
+        .map(|(query, vector)| Query {
             id: query.id,
             text: query.text,
             vector,
-        });
-    }
+        })
+        .collect();
     let header = Header {
         version: data::FORMAT_VERSION,
         name: input.name,
@@ -151,9 +157,9 @@ fn main() -> Result<(), Error> {
         header.document_count as f64 / document_time.as_secs_f64()
     );
     println!(
-        "Query embedding: {:.1} ms total, {:.1} ms mean (one pass; includes first inference)",
-        query_times.iter().sum::<f64>(),
-        query_times.iter().sum::<f64>() / query_times.len() as f64
+        "Query embedding: {:.1} ms total, {:.1} ms/query (batched; includes first inference)",
+        query_time.as_secs_f64() * 1000.0,
+        query_time.as_secs_f64() * 1000.0 / header.queries.len() as f64
     );
     println!("Prepared dataset: {}", output_path.display());
     Ok(())

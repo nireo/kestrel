@@ -148,6 +148,11 @@ impl Collection {
         Ok(self.embedder.embed_query(query)?)
     }
 
+    /// Prepare query embeddings in bounded batches, preserving input order.
+    pub fn embed_queries(&mut self, queries: &[&str]) -> Result<Vec<Vec<f32>>, CollectionError> {
+        Ok(self.embedder.embed_queries(queries)?)
+    }
+
     /// Chunk and embed a document without inserting it. Prepared output can be
     /// passed to either `RetrievalCollection` or `PersistentCollection`.
     pub fn prepare_document(
@@ -222,6 +227,25 @@ impl Collection {
     ) -> Result<Vec<ChunkHit>, CollectionError> {
         let query_vector = self.embed_query(query)?;
         self.search_with_vector(query, &query_vector, options)
+    }
+
+    /// Batch query embedding, then retrieve each ranking in input order with
+    /// reusable BM25 scratch. Blank inputs reject the batch before inference.
+    pub fn search_many(
+        &mut self,
+        queries: &[&str],
+        options: HybridSearchOptions,
+    ) -> Result<Vec<Vec<ChunkHit>>, CollectionError> {
+        let vectors = self.embed_queries(queries)?;
+        let mut scratch = crate::Bm25Scratch::default();
+        queries
+            .iter()
+            .zip(vectors)
+            .map(|(query, vector)| {
+                self.retrieval
+                    .search_with_vector_and_scratch(query, &vector, options, &mut scratch)
+            })
+            .collect()
     }
 
     /// Read-only retrieval with a precomputed query embedding. The vector must

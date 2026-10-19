@@ -1,5 +1,7 @@
+use std::borrow::Cow;
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::ops::Range;
 
 mod chunking;
 mod collection;
@@ -56,6 +58,17 @@ pub enum IndexError {
 pub struct InvertedIndex {
     core: LexicalIndex,
     documents: Vec<String>,
+}
+
+/// Reusable BM25 workspace for one reader. Share the index across threads and
+/// keep a separate workspace per reader. Retains O(N) score capacity for the
+/// largest index searched; only matched rows are cleared after scoring.
+#[derive(Debug, Default)]
+pub struct Bm25Scratch {
+    normalized: String,
+    seen: Vec<Range<usize>>,
+    scores: Vec<f64>,
+    touched: Vec<DocId>,
 }
 
 /// Scoring data shared by standalone document search and collection chunks.
@@ -122,6 +135,18 @@ impl InvertedIndex {
     /// Repeated terms count once. Ties prefer lower IDs; scores are not probabilities.
     pub fn search(&self, query: &str, limit: usize) -> Vec<SearchHit> {
         self.core.search(query, limit)
+    }
+
+    /// Search with reusable dense score storage, avoiding per-match hashing.
+    /// Results and validation match `search`; the workspace may be reused with
+    /// other indexes and after appending documents.
+    pub fn search_with_scratch(
+        &self,
+        query: &str,
+        limit: usize,
+        scratch: &mut Bm25Scratch,
+    ) -> Vec<SearchHit> {
+        self.core.search_with_scratch(query, limit, scratch)
     }
 }
 
@@ -211,18 +236,97 @@ impl LexicalIndex {
             return Vec::new();
         }
 
+        let normalized = if query.is_ascii() && !query.bytes().any(|b| b.is_ascii_uppercase()) {
+            Cow::Borrowed(query)
+        } else {
+            Cow::Owned(query.to_lowercase())
+        };
+        let mut seen = Vec::new();
+        let mut scores = HashMap::<DocId, f64>::new();
+        self.accumulate(&normalized, &mut seen, |doc_id, contribution| {
+            *scores.entry(doc_id).or_default() += contribution;
+        });
+
+        top_k(
+            scores
+                .into_iter()
+                .map(|(doc_id, score)| SearchHit { doc_id, score }),
+            limit,
+        )
+    }
+
+    pub(crate) fn search_with_scratch(
+        &self,
+        query: &str,
+        limit: usize,
+        scratch: &mut Bm25Scratch,
+    ) -> Vec<SearchHit> {
+        scratch.seen.clear();
+        if limit == 0 || self.total_tokens == 0 {
+            return Vec::new();
+        }
+        scratch.normalized.clear();
+        if query.is_ascii() {
+            scratch.normalized.push_str(query);
+            scratch.normalized.make_ascii_lowercase();
+        } else {
+            // Use str's contextual Unicode lowercasing, matching indexing.
+            scratch.normalized.push_str(&query.to_lowercase());
+        }
+        if scratch.scores.len() < self.len() {
+            scratch.scores.resize(self.len(), 0.0);
+        }
+        self.accumulate(
+            &scratch.normalized,
+            &mut scratch.seen,
+            |id, contribution| {
+                let score = &mut scratch.scores[id as usize];
+                if *score == 0.0 {
+                    scratch.touched.push(id);
+                }
+                *score += contribution;
+            },
+        );
+        top_k(
+            scratch.touched.drain(..).map(|doc_id| {
+                let score = std::mem::replace(&mut scratch.scores[doc_id as usize], 0.0);
+                SearchHit { doc_id, score }
+            }),
+            limit,
+        )
+    }
+
+    fn accumulate(
+        &self,
+        normalized: &str,
+        seen: &mut Vec<Range<usize>>,
+        mut add: impl FnMut(DocId, f64),
+    ) {
         const K1: f64 = 1.2;
         const B: f64 = 0.75;
         let document_count = self.len() as f64;
         let length_scale = K1 * B / self.average_document_length();
         let length_base = K1 * (1.0 - B);
-        let normalized = query.to_lowercase();
-        let mut seen = HashSet::new();
-        let mut scores = HashMap::<DocId, f64>::new();
+        let mut many_terms = None;
 
-        for term in tokens(&normalized) {
-            if !seen.insert(term) {
-                continue;
+        for term in tokens(normalized) {
+            // A short query needs no hash table. Switch to hashing for long
+            // queries so duplicate detection does not become quadratic.
+            if seen.len() == 16 {
+                let terms = many_terms.get_or_insert_with(|| {
+                    seen.iter()
+                        .map(|range| &normalized[range.clone()])
+                        .collect::<HashSet<_>>()
+                });
+                if !terms.insert(term) {
+                    continue;
+                }
+            } else {
+                if seen.iter().any(|range| &normalized[range.clone()] == term) {
+                    continue;
+                }
+                let start = term.as_ptr() as usize - normalized.as_ptr() as usize;
+                seen.push(start..start + term.len());
             }
             let postings = self.postings(term);
             if postings.is_empty() {
@@ -239,17 +343,9 @@ impl LexicalIndex {
                 let tf = f64::from(posting.term_frequency);
                 let length = f64::from(self.document_lengths[posting.doc_id as usize]);
                 let contribution = weight * tf / (tf + length_base + length_scale * length);
-                *scores.entry(posting.doc_id).or_default() += contribution;
+                add(posting.doc_id, contribution);
             }
         }
-
-        // The score map is sparse: unmatched documents have no entry.
-        top_k(
-            scores
-                .into_iter()
-                .map(|(doc_id, score)| SearchHit { doc_id, score }),
-            limit,
-        )
     }
 }
 

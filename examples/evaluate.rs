@@ -66,13 +66,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut measurements: [Vec<Metrics>; 3] = std::array::from_fn(|_| Vec::new());
-    for query in &dataset.queries {
+    let queries: Vec<_> = dataset.queries.iter().map(|q| q.text.as_str()).collect();
+    let query_vectors = embedder.embed_queries(&queries)?;
+    for (query, query_vector) in dataset.queries.iter().zip(query_vectors) {
         let relevant: HashSet<_> = query
             .relevant_document_ids
             .iter()
             .map(|id| document_ids[id.as_str()])
             .collect();
-        let query_vector = embedder.embed_query(&query.text)?;
         // Retrieve full rankings for reciprocal rank; only recall uses top 5.
         let options = HybridSearchOptions {
             candidate_depth,
