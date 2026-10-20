@@ -317,3 +317,46 @@ fn acknowledged_batches_survive_process_exit_without_cleanup() {
     assert_eq!(reopened.retrieval().len(), 2);
     assert_eq!(reopened.retrieval().document(1), Some("second"));
 }
+
+#[test]
+fn reused_payload_buffers_keep_wire_format_and_do_not_retain_large_records() {
+    let mut buffer = vec![255; 128];
+    for text in [
+        "a longer original payload",
+        "x",
+        "another payload after reuse",
+    ] {
+        let documents = vec![document(text, [1.0, 0.0])];
+        encode_into(&documents, MAX_BATCH_BYTES, &mut buffer).unwrap();
+        assert_eq!(buffer, postcard::to_stdvec(&documents).unwrap());
+        let mut framed = Vec::new();
+        write_frame(&mut framed, &buffer).unwrap();
+        let mut remaining = framed.len() as u64;
+        recycle_buffer(&mut buffer);
+        assert!(matches!(
+            read_frame(
+                &mut framed.as_slice(),
+                &mut remaining,
+                MAX_BATCH_BYTES,
+                &mut buffer
+            )
+            .unwrap(),
+            Frame::Complete
+        ));
+        let restored: Vec<PreparedDocument> = decode(&buffer).unwrap();
+        assert_eq!(restored, documents);
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("collection.kestrel");
+    let mut stored =
+        PersistentCollection::create(&path, CONFIG, ChunkingConfig::default()).unwrap();
+    let large = "x".repeat(MAX_RETAINED_BYTES + 1);
+    stored.add_document(document(&large, [1.0, 0.0])).unwrap();
+    assert!(stored.buffer.capacity() <= MAX_RETAINED_BYTES);
+    stored.add_document(document("small", [0.0, 1.0])).unwrap();
+    drop(stored);
+    let reopened = PersistentCollection::open(&path, CONFIG).unwrap();
+    assert_eq!(reopened.retrieval().document(0), Some(large.as_str()));
+    assert_eq!(reopened.retrieval().document(1), Some("small"));
+    assert!(reopened.buffer.capacity() <= MAX_RETAINED_BYTES);
+}

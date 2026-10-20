@@ -116,3 +116,68 @@ construction was effectively unchanged (16.737 vs 16.674 ms). A 10,000-row index
 retained 198,536 fewer bytes (about 194 KiB). With the first four changes combined,
 lookups took 1.477 ms and build time was 16.954 ms. This optimizes access by ID;
 it does not reduce the number of vectors scored during an IVF query.
+
+## 5. reuse bounded persistence payload buffers
+
+A PersistentCollection keeps one serialization buffer. Recovery reads each frame
+into that same buffer, decodes owned documents, and clears it before publishing.
+Postcard writes into the existing Vec through its std::io::Write serializer;
+tests compare the resulting bytes with the original serializer. Frame bytes,
+checksums, size limits, atomicity, crash recovery, and sync frequency are unchanged.
+Buffers with capacity above 1 MiB are released after use, including on errors.
+This avoids retaining the maximum 64 MiB payload on every writer.
+
+```rust
+bytes.clear();
+postcard::to_io(value, &mut *bytes)?;
+// after reading/encoding a record
+bytes.clear();
+if bytes.capacity() > MAX_RETAINED_BYTES {
+    *bytes = Vec::new();
+}
+```
+
+Measured alone over 4,096 rows / 64 batches: append allocations fell from 26,708
+to 25,821 and cumulative requested bytes from 35,325,159 to 21,792,948 (38% less).
+Recovery allocations fell from 34,075 to 34,013 and requested bytes from
+28,343,389 to 22,227,066 (22% less). Append time was 261.951 vs 263.039 ms;
+reopening was 8.470 vs 8.502 ms. Neither is a meaningful latency improvement.
+Ordinary reusable buffers do retain additional memory: about 160–200 KiB in
+these cases, bounded by the 1 MiB retention limit.
+
+## all five combined
+
+A fresh three-run comparison against the original baseline used the same harness,
+inputs, release configuration, and sync contract. Times below are milliseconds.
+
+| case | baseline | combined | interpretation |
+| --- | ---: | ---: | --- |
+| construct 100k vectors | 36.483 | 28.408 | 1.28× faster |
+| ingest 10k documents | 5.826 | 5.036 | 1.16× faster |
+| 64 exact hybrid queries | 33.129 | 33.029 | effectively unchanged |
+| 64 IVF hybrid queries | 4.673 | 4.605 | small difference |
+| build IVF over 10k vectors | 16.687 | 16.688 | effectively unchanged |
+| 1m IVF ID lookups | 6.787 | 1.444 | 4.70× faster |
+| durably append 4,096 documents | 262.543 | 260.294 | effectively unchanged |
+| reopen 4,096 documents | 8.139 | 8.212 | effectively unchanged |
+
+The combined 100k-vector construction uses two allocations and retains
+154,000,000 bytes versus 100,034 allocations and 201,850,880 bytes originally.
+Collection ingestion allocations fall from 61,263 to 51,201. Exact and IVF query
+allocations are both 64 for 64 queries, versus 368 and 688. Durable append
+allocation traffic falls to 15,401,364 bytes; recovery falls to 22,126,938 bytes.
+No unmeasured large latency gain is claimed for buffer reuse or scratch storage.
+
+Validation: formatting and warning-free Clippy pass, along with 99 regular tests
+and seven opt-in real-model tests. Existing storage corruption, truncation,
+poisoning, process-exit durability, vector-bit preservation, and exact/IVF
+consistency tests pass. New tests exercise reservation, normalization failures,
+full-workspace reuse and concurrent readers, dense/sparse IVF permutations, wire
+compatibility, and bounded persistence buffer retention.
+
+Per-case medians and allocation results are in
+`target/performance-followups/summary.json`. The folder also contains raw JSONL,
+source snapshot archives for the isolated and combined builds, patches, the
+snapshot runner, build logs, and validation logs. The initial preallocation
+comparison above predates the fresh combined comparison, so its baseline timings
+differ slightly from the final table.

@@ -20,6 +20,8 @@ const MAX_HEADER_BYTES: usize = 64 * 1024;
 /// Split larger transactions into smaller batches. Recovery buffers one encoded
 /// transaction at a time, rather than holding the complete file in memory.
 const MAX_BATCH_BYTES: usize = 64 * 1024 * 1024;
+// Keep ordinary batch buffers, but do not pin a rare 64 MiB record per writer.
+const MAX_RETAINED_BYTES: usize = 1024 * 1024;
 const FRAME_PREFIX_BYTES: usize = 12; // u64 payload length + CRC32 of length
 
 #[derive(Debug, thiserror::Error)]
@@ -87,6 +89,7 @@ pub struct PersistentCollection {
     // None after a write/flush/sync failure. Taking the writer lets us discard
     // its pending bytes without BufWriter retrying a failed flush during Drop.
     writer: Option<BufWriter<File>>,
+    buffer: Vec<u8>,
 }
 
 impl PersistentCollection {
@@ -143,6 +146,7 @@ impl PersistentCollection {
         Ok(Self {
             retrieval,
             writer: Some(writer),
+            buffer: header,
         })
     }
 
@@ -176,12 +180,14 @@ impl PersistentCollection {
         }
 
         let mut remaining = file_len - 12;
-        let Frame::Complete(bytes) = read_frame(&mut reader, &mut remaining, MAX_HEADER_BYTES)?
+        let mut buffer = Vec::new();
+        let Frame::Complete =
+            read_frame(&mut reader, &mut remaining, MAX_HEADER_BYTES, &mut buffer)?
         else {
             return Err(StorageError::InvalidData("incomplete configuration header").into());
         };
 
-        let header: Header = decode(&bytes)?;
+        let header: Header = decode(&buffer)?;
         if header.tokenizer_version != TOKENIZER_VERSION {
             return Err(StorageError::InvalidData("unsupported tokenizer version").into());
         }
@@ -193,10 +199,10 @@ impl PersistentCollection {
         let mut retrieval = RetrievalCollection::new(embedding, header.chunking)?;
         let mut valid_end = file_len - remaining;
         let torn_tail = loop {
-            match read_frame(&mut reader, &mut remaining, MAX_BATCH_BYTES)? {
-                Frame::Complete(bytes) => {
-                    let documents: Vec<PreparedDocument> = decode(&bytes)?;
-                    drop(bytes);
+            match read_frame(&mut reader, &mut remaining, MAX_BATCH_BYTES, &mut buffer)? {
+                Frame::Complete => {
+                    let documents: Vec<PreparedDocument> = decode(&buffer)?;
+                    recycle_buffer(&mut buffer);
                     if documents.is_empty() {
                         return Err(StorageError::InvalidData("empty transaction").into());
                     }
@@ -207,6 +213,7 @@ impl PersistentCollection {
                 Frame::Incomplete => break true,
             }
         };
+        recycle_buffer(&mut buffer);
 
         drop(reader);
         if torn_tail {
@@ -222,6 +229,7 @@ impl PersistentCollection {
         Ok(Self {
             retrieval,
             writer: Some(BufWriter::new(file)),
+            buffer,
         })
     }
 
@@ -246,16 +254,21 @@ impl PersistentCollection {
         documents: impl AsMut<[PreparedDocument]> + IntoIterator<Item = PreparedDocument>,
     ) -> Result<Range<usize>, CollectionError> {
         let writer = self.writer.as_mut().ok_or(StorageError::Poisoned)?;
+        let buffer = &mut self.buffer;
         let mut failed = false;
         let result = self
             .retrieval
             .data
             .insert_batch(documents, true, |documents| {
-                let bytes = encode(documents, MAX_BATCH_BYTES)?;
-                let result = write_synced_frame(writer, &bytes);
+                encode_into(documents, MAX_BATCH_BYTES, buffer)?;
+                let result = write_synced_frame(writer, buffer);
                 failed = result.is_err();
+                // Release oversized payloads before publishing the decoded
+                // documents into the indexes, matching the original peak usage.
+                recycle_buffer(buffer);
                 result.map_err(CollectionError::from)
             });
+        recycle_buffer(buffer);
         if failed {
             let writer = self
                 .writer
@@ -293,11 +306,29 @@ fn lock(file: &File) -> Result<(), StorageError> {
 }
 
 fn encode(value: &(impl Serialize + ?Sized), limit: usize) -> Result<Vec<u8>, StorageError> {
-    let bytes = postcard::to_stdvec(value)?;
+    let mut bytes = Vec::new();
+    encode_into(value, limit, &mut bytes)?;
+    Ok(bytes)
+}
+
+fn encode_into(
+    value: &(impl Serialize + ?Sized),
+    limit: usize,
+    bytes: &mut Vec<u8>,
+) -> Result<(), StorageError> {
+    bytes.clear();
+    postcard::to_io(value, &mut *bytes)?;
     if bytes.len() > limit {
         return Err(StorageError::RecordTooLarge { max_bytes: limit });
     }
-    Ok(bytes)
+    Ok(())
+}
+
+fn recycle_buffer(bytes: &mut Vec<u8>) {
+    bytes.clear();
+    if bytes.capacity() > MAX_RETAINED_BYTES {
+        *bytes = Vec::new();
+    }
 }
 
 fn decode<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> Result<T, StorageError> {
@@ -326,7 +357,7 @@ fn write_synced_frame(writer: &mut BufWriter<File>, bytes: &[u8]) -> Result<(), 
 }
 
 enum Frame {
-    Complete(Vec<u8>),
+    Complete,
     End,
     Incomplete,
 }
@@ -335,6 +366,7 @@ fn read_frame(
     reader: &mut impl Read,
     remaining: &mut u64,
     limit: usize,
+    bytes: &mut Vec<u8>,
 ) -> Result<Frame, StorageError> {
     if *remaining == 0 {
         return Ok(Frame::End);
@@ -357,17 +389,17 @@ fn read_frame(
     if *remaining < frame_size {
         return Ok(Frame::Incomplete);
     }
-    let mut bytes = vec![0; length as usize];
-    reader.read_exact(&mut bytes)?;
+    bytes.resize(length as usize, 0);
+    reader.read_exact(bytes)?;
     let mut checksum = [0; 4];
     reader.read_exact(&mut checksum)?;
-    if crc32fast::hash(&bytes) != u32::from_le_bytes(checksum) {
+    if crc32fast::hash(bytes) != u32::from_le_bytes(checksum) {
         return Err(StorageError::InvalidData(
             "record payload checksum mismatch",
         ));
     }
     *remaining -= frame_size;
-    Ok(Frame::Complete(bytes))
+    Ok(Frame::Complete)
 }
 
 #[cfg(test)]
