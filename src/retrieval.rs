@@ -92,7 +92,7 @@ impl CollectionData {
                 .map_err(CollectionError::InvalidDocument)?;
             for chunk in &mut document.chunks {
                 if normalize_vectors {
-                    chunk.embedding = self.vectors.normalize(&chunk.embedding)?;
+                    self.vectors.normalize_in_place(&mut chunk.embedding)?;
                 } else {
                     self.vectors.validate_normalized(&chunk.embedding)?;
                 }

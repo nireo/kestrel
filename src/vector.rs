@@ -86,8 +86,13 @@ impl VectorIndex {
         if self.position(doc_id).is_some() {
             return Err(VectorError::DuplicateDocument { doc_id });
         }
-        let normalized = self.normalize(vector)?;
-        self.append_normalized(doc_id, &normalized);
+        let length = vector_length(vector, self.dimensions)?;
+        self.vectors.extend(
+            vector
+                .iter()
+                .map(|&component| (f64::from(component) / length) as f32),
+        );
+        self.append_id(doc_id);
         Ok(())
     }
 
@@ -96,6 +101,11 @@ impl VectorIndex {
     pub(crate) fn append_normalized(&mut self, doc_id: DocId, normalized: &[f32]) {
         debug_assert_eq!(normalized.len(), self.dimensions);
         debug_assert!(self.position(doc_id).is_none());
+        self.vectors.extend_from_slice(normalized);
+        self.append_id(doc_id);
+    }
+
+    fn append_id(&mut self, doc_id: DocId) {
         let row = self.len();
 
         if self.positions.is_none()
@@ -113,7 +123,6 @@ impl VectorIndex {
             );
         }
 
-        self.vectors.extend_from_slice(normalized);
         self.doc_ids.push(doc_id);
         if let Some(positions) = &mut self.positions {
             positions.insert(doc_id, row);
@@ -208,6 +217,15 @@ pub(crate) fn normalize(vector: &[f32], dimensions: usize) -> Result<Vec<f32>, V
         .collect())
 }
 
+pub(crate) fn normalize_in_place(vector: &mut [f32], dimensions: usize) -> Result<(), VectorError> {
+    // Validate the entire input before changing any component.
+    let length = vector_length(vector, dimensions)?;
+    for component in vector {
+        *component = (f64::from(*component) / length) as f32;
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_normalized(vector: &[f32], dimensions: usize) -> Result<(), VectorError> {
     let length = vector_length(vector, dimensions)?;
     // Allow rounding from f64 normalization back to stored f32 components.
@@ -238,4 +256,28 @@ fn vector_length(vector: &[f32], dimensions: usize) -> Result<f64, VectorError> 
         return Err(VectorError::ZeroVector);
     }
     Ok(squared_length.sqrt())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn in_place_normalization_validates_before_modifying_input() {
+        for mut vector in [vec![3.0, f32::NAN], vec![0.0, 0.0], vec![3.0]] {
+            let before: Vec<_> = vector.iter().map(|v| v.to_bits()).collect();
+            assert!(normalize_in_place(&mut vector, 2).is_err());
+            assert_eq!(
+                vector.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                before
+            );
+        }
+        for mut vector in [
+            vec![f32::MAX, f32::MAX / 2.0],
+            vec![f32::MIN_POSITIVE, 1e-40],
+        ] {
+            let expected = normalize(&vector, 2).unwrap();
+            normalize_in_place(&mut vector, 2).unwrap();
+            assert_eq!(vector, expected);
+        }
+    }
 }

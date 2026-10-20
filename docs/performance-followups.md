@@ -48,3 +48,27 @@ with live index allocations falling from 201,850,880 to 154,000,000 bytes: a
 47,850,880-byte (45.63 MiB) saving. Collection ingestion fell from 5.808 to
 5.117 ms (1.14×). Query latency was effectively unchanged. Durable append time
 remained dominated by syncs; no write-latency improvement is claimed.
+
+## 2. normalize owned embeddings in place
+
+Prepared chunks validate the full vector, then divide their existing components
+by the f64 norm. Direct VectorIndex insertion similarly extends the destination
+from normalized components, avoiding a temporary Vec. Invalid inputs are checked
+before modifying either the input buffer or the index. Arithmetic and stored
+float bits match the original normalization.
+
+```rust
+let length = vector_length(vector, dimensions)?;
+for component in vector {
+    *component = (f64::from(*component) / length) as f32;
+}
+```
+
+Measured alone against the original baseline: vector construction fell from
+36.158 to 33.941 ms (1.07×), and allocations fell from 100,034 to 34. Collection
+insertion fell from 5.890 to 5.761 ms; allocations fell from 61,263 to 51,263,
+removing 15,360,000 bytes of cumulative allocation traffic. Together with
+preallocation, vector construction took 28.053 ms with two allocations and
+154,000,000 live bytes; collection insertion took 5.066 ms. These standalone and
+combined comparisons use separate source snapshots, not just successive timings
+of the cumulative branch.
