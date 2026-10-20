@@ -179,6 +179,20 @@ impl CollectionData {
         options: HybridSearchOptions,
         scratch: &mut SearchScratch,
     ) -> Result<Vec<ChunkHit>, VectorError> {
+        let mut output = Vec::new();
+        self.search_into(query, vector, options, scratch, &mut output)?;
+        Ok(output)
+    }
+
+    fn search_into(
+        &self,
+        query: &str,
+        vector: &[f32],
+        options: HybridSearchOptions,
+        scratch: &mut SearchScratch,
+        output: &mut Vec<ChunkHit>,
+    ) -> Result<(), VectorError> {
+        output.clear();
         let depth = if options.limit == 0 {
             0
         } else {
@@ -210,20 +224,17 @@ impl CollectionData {
             &mut scratch.heap,
             &mut scratch.selected,
         );
-        Ok(scratch
-            .selected
-            .iter()
-            .map(|selected| {
-                let hit = scratch.candidates[selected.doc_id as usize];
-                ChunkHit {
-                    chunk_id: ChunkId(hit.doc_id),
-                    doc_id: self.chunks[hit.doc_id as usize].doc_id,
-                    score: hit.score,
-                    bm25_rank: hit.bm25_rank,
-                    vector_rank: hit.vector_rank,
-                }
-            })
-            .collect())
+        output.extend(scratch.selected.iter().map(|selected| {
+            let hit = scratch.candidates[selected.doc_id as usize];
+            ChunkHit {
+                chunk_id: ChunkId(hit.doc_id),
+                doc_id: self.chunks[hit.doc_id as usize].doc_id,
+                score: hit.score,
+                bm25_rank: hit.bm25_rank,
+                vector_rank: hit.vector_rank,
+            }
+        }));
+        Ok(())
     }
 }
 
@@ -344,6 +355,76 @@ impl RetrievalCollection {
         Ok(self
             .data
             .search_with_workspace(query, query_vector, options, scratch)?)
+    }
+
+    /// Retrieve into caller-owned result storage, retaining its capacity.
+    /// Clears `output` before validation, including when the query errors.
+    pub fn search_into(
+        &self,
+        query: &str,
+        query_vector: &[f32],
+        options: HybridSearchOptions,
+        scratch: &mut SearchScratch,
+        output: &mut Vec<ChunkHit>,
+    ) -> Result<(), CollectionError> {
+        output.clear();
+        if query.trim().is_empty() {
+            return Err(EmbeddingError::EmptyText { index: 0 }.into());
+        }
+        Ok(self
+            .data
+            .search_into(query, query_vector, options, scratch, output)?)
+    }
+
+    /// Retrieve a batch in input order with one workspace per worker.
+    /// Worker count is capped by batch size and available CPU parallelism.
+    /// One worker runs inline; larger batches use scoped threads per call.
+    pub fn search_many_with_vectors(
+        &self,
+        queries: &[(&str, &[f32])],
+        options: HybridSearchOptions,
+        workers: std::num::NonZeroUsize,
+    ) -> Result<Vec<Vec<ChunkHit>>, CollectionError> {
+        if queries.is_empty() {
+            return Ok(Vec::new());
+        }
+        let workers = workers
+            .get()
+            .min(queries.len())
+            .min(std::thread::available_parallelism().map_or(1, |n| n.get()));
+        let run = |batch: &[(&str, &[f32])]| {
+            let mut scratch = SearchScratch::default();
+            batch
+                .iter()
+                .map(|(query, vector)| {
+                    self.search_with_scratch(query, vector, options, &mut scratch)
+                })
+                .collect::<Result<Vec<_>, _>>()
+        };
+        if workers == 1 {
+            return run(queries);
+        }
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = queries
+                .chunks(queries.len().div_ceil(workers))
+                .map(|batch| scope.spawn(move || run(batch)))
+                .collect();
+            // Join every worker before returning; collecting in input order also
+            // makes the first reported validation error deterministic.
+            let batches: Vec<_> = handles
+                .into_iter()
+                .map(|handle| {
+                    handle
+                        .join()
+                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+                })
+                .collect();
+            let mut output = Vec::with_capacity(queries.len());
+            for batch in batches {
+                output.extend(batch?);
+            }
+            Ok(output)
+        })
     }
 
     pub fn len(&self) -> usize {

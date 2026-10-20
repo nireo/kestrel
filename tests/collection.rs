@@ -54,6 +54,14 @@ fn collection_coordinates_real_embeddings_ids_search_and_failed_insertions()
     ));
     let queries = [query, "How do I cook pasta?"];
     let batched = collection.search_many(&queries, options)?;
+    assert_eq!(
+        collection.search_many_with_workers(
+            &queries,
+            options,
+            std::num::NonZeroUsize::new(2).unwrap()
+        )?,
+        batched
+    );
     for (query, hits) in queries.iter().zip(batched) {
         let single = collection.search(query, options)?;
         assert_eq!(hits, single);

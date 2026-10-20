@@ -1,5 +1,5 @@
 //! Allocation and latency measurements for ingestion, retrieval, and persistence.
-//! Use --only vector|ingest|query|ivf|storage to isolate a stage. No model is loaded.
+//! Use --only vector|ingest|query|batch|ivf|storage to isolate a stage. No model is loaded.
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::hint::black_box;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
@@ -164,7 +164,10 @@ fn main() -> Result<(), Error> {
         }
     }
     if rounds == 0
-        || !["all", "vector", "ingest", "query", "ivf", "storage"].contains(&only.as_str())
+        || ![
+            "all", "vector", "ingest", "query", "batch", "ivf", "storage",
+        ]
+        .contains(&only.as_str())
     {
         return Err("invalid benchmark options".into());
     }
@@ -292,6 +295,86 @@ fn main() -> Result<(), Error> {
                     scratch
                 },
             );
+        }
+    }
+    if enabled("batch") {
+        let mut index = collection(10_000, reserve);
+        let vectors: Vec<_> = (0..64).map(vector).collect();
+        let queries: Vec<_> = (0..64).map(|i| format!("search topic{i}")).collect();
+        let inputs: Vec<_> = queries
+            .iter()
+            .zip(&vectors)
+            .map(|(q, v)| (q.as_str(), v.as_slice()))
+            .collect();
+        let options = HybridSearchOptions::default();
+        for (mode_name, mode) in [
+            ("exact", VectorSearchMode::Exact),
+            (
+                "ivf",
+                VectorSearchMode::Ivf {
+                    build: build_options(),
+                    probes: 4,
+                },
+            ),
+        ] {
+            index.set_vector_search_mode(mode)?;
+            let expected: Vec<_> = inputs
+                .iter()
+                .map(|(q, v)| index.search_with_vector(q, v, options).unwrap())
+                .collect();
+            for workers in [1, 2, 4, 8] {
+                let workers = std::num::NonZeroUsize::new(workers).unwrap();
+                assert_eq!(
+                    index.search_many_with_vectors(&inputs, options, workers)?,
+                    expected
+                );
+                measure(
+                    &format!("batch_{mode_name}_workers_{workers}"),
+                    rounds,
+                    64,
+                    || (),
+                    |()| {
+                        index
+                            .search_many_with_vectors(&inputs, options, workers)
+                            .unwrap()
+                    },
+                );
+            }
+            for reuse in [false, true] {
+                measure(
+                    &format!("results_{mode_name}_reuse_{reuse}"),
+                    rounds,
+                    64,
+                    || {
+                        let mut scratch = SearchScratch::default();
+                        let mut output = Vec::new();
+                        for ((q, v), expected) in inputs.iter().zip(&expected) {
+                            index
+                                .search_into(q, v, options, &mut scratch, &mut output)
+                                .unwrap();
+                            assert_eq!(&output, expected);
+                        }
+                        (scratch, output)
+                    },
+                    |(mut scratch, mut output)| {
+                        for (q, v) in &inputs {
+                            if reuse {
+                                index
+                                    .search_into(q, v, options, &mut scratch, &mut output)
+                                    .unwrap();
+                                black_box(&output);
+                            } else {
+                                black_box(
+                                    index
+                                        .search_with_scratch(q, v, options, &mut scratch)
+                                        .unwrap(),
+                                );
+                            }
+                        }
+                        (scratch, output)
+                    },
+                );
+            }
         }
     }
     if enabled("ivf") {

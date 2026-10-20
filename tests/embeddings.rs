@@ -26,6 +26,16 @@ fn real_embeddings_support_batching_validation_and_semantic_search()
         Err(EmbeddingError::EmptyText { index: 0 })
     ));
 
+    let mut invalid = vec!["valid"; 65];
+    invalid[64] = " ";
+    assert!(matches!(
+        embedder.embed_queries(&invalid),
+        Err(EmbeddingError::EmptyText { index: 64 })
+    ));
+    assert!(matches!(
+        embedder.embed_documents(&invalid),
+        Err(EmbeddingError::EmptyText { index: 64 })
+    ));
     let texts = [
         "Reset your password using the recovery link sent to your email address.",
         "Boil pasta in salted water, then serve it with tomato sauce.",

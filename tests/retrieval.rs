@@ -393,3 +393,75 @@ fn full_workspace_preserves_rankings_across_modes_limits_errors_and_readers() {
             .unwrap()
     );
 }
+
+#[test]
+fn reusable_results_and_parallel_batches_preserve_rankings_and_validation() {
+    let mut core = collection();
+    core.add_documents(vec![
+        single("rust engine", [1.0, 0.0]),
+        single("café", [0.0, 1.0]),
+    ])
+    .unwrap();
+    let inputs = [
+        ("rust", &[1.0, 0.0][..]),
+        ("café", &[0.0, 1.0][..]),
+        ("unknown", &[-1.0, 0.0][..]),
+    ];
+    let mut scratch = kestrel::SearchScratch::default();
+    let mut output = Vec::new();
+    for mode in [VectorSearchMode::Exact, ivf_mode()] {
+        core.set_vector_search_mode(mode).unwrap();
+        for limit in [0, 1, 10] {
+            let options = HybridSearchOptions {
+                limit,
+                ..Default::default()
+            };
+            let expected: Vec<_> = inputs
+                .iter()
+                .map(|(q, v)| core.search_with_vector(q, v, options).unwrap())
+                .collect();
+            for ((q, v), expected) in inputs.iter().zip(&expected) {
+                core.search_into(q, v, options, &mut scratch, &mut output)
+                    .unwrap();
+                assert_eq!(&output, expected);
+            }
+            for workers in [1, 2, usize::MAX] {
+                let workers = std::num::NonZeroUsize::new(workers).unwrap();
+                assert_eq!(
+                    core.search_many_with_vectors(&inputs, options, workers)
+                        .unwrap(),
+                    expected
+                );
+                assert!(
+                    core.search_many_with_vectors(&[], options, workers)
+                        .unwrap()
+                        .is_empty()
+                );
+                let invalid = [("rust", &[1.0][..]), (" ", &[1.0, 0.0][..])];
+                assert!(matches!(
+                    core.search_many_with_vectors(&invalid, options, workers),
+                    Err(CollectionError::Vector(
+                        VectorError::DimensionMismatch { .. }
+                    ))
+                ));
+            }
+        }
+    }
+    let options = HybridSearchOptions::default();
+    core.search_into("rust", &[1.0, 0.0], options, &mut scratch, &mut output)
+        .unwrap();
+    assert!(!output.is_empty());
+    assert!(
+        core.search_into(" ", &[1.0, 0.0], options, &mut scratch, &mut output)
+            .is_err()
+    );
+    assert!(output.is_empty());
+    assert!(
+        core.search_into("rust", &[0.0, 0.0], options, &mut scratch, &mut output)
+            .is_err()
+    );
+    assert!(output.is_empty());
+    core.search_into("rust", &[1.0, 0.0], options, &mut scratch, &mut output)
+        .unwrap();
+    assert!(!output.is_empty());
+}

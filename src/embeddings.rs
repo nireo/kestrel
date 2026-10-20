@@ -98,22 +98,10 @@ impl TextEmbedder {
     }
 
     /// Embed documents in batches, preserving input order. No instruction is
-    /// added to passages. Empty batches return no vectors; blank texts error.
+    /// added to passages. Larger batches group similar byte lengths to reduce
+    /// padding. Empty batches return no vectors; blank texts error.
     pub fn embed_documents(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
-        validate_texts(texts)?;
-        if texts.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // Pool one batch before running the next: FastEmbed retains the raw
-        // token-level outputs of each batch in a single embed() call.
-        let mut vectors = Vec::with_capacity(texts.len());
-        for batch in texts.chunks(EMBEDDING_BATCH_SIZE) {
-            let batch_vectors = self.model.embed(batch, None)?;
-            validate_output(&batch_vectors, batch.len())?;
-            vectors.extend(batch_vectors);
-        }
-        Ok(vectors)
+        self.embed_batch(texts, false)
     }
 
     /// Add BGE's retrieval instruction and embed a single query. Pass the
@@ -127,19 +115,43 @@ impl TextEmbedder {
     }
 
     /// Embed queries in bounded batches with BGE's retrieval instruction.
-    /// Preserves input order. Validates all inputs before running inference;
+    /// Groups larger batches by byte length, then restores input order.
+    /// Validates all inputs before running inference;
     /// empty batches return no vectors and blank texts report their input index.
     pub fn embed_queries(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        self.embed_batch(texts, true)
+    }
+
+    fn embed_batch(
+        &mut self,
+        texts: &[&str],
+        queries: bool,
+    ) -> Result<Vec<Vec<f32>>, EmbeddingError> {
         validate_texts(texts)?;
-        let mut vectors = Vec::with_capacity(texts.len());
-        for batch in texts.chunks(EMBEDDING_BATCH_SIZE) {
-            let inputs: Vec<_> = batch
-                .iter()
-                .map(|text| format!("{}{text}", CONFIG.query_instruction))
-                .collect();
-            let batch_vectors = self.model.embed(inputs, None)?;
+        let mut order: Vec<_> = (0..texts.len()).collect();
+        // Byte length is a cheap proxy for token count. Avoid a second tokenizer
+        // pass and reduce BatchLongest padding when inputs cross batch boundaries.
+        if texts.len() > EMBEDDING_BATCH_SIZE {
+            order.sort_unstable_by_key(|&index| texts[index].len());
+        }
+        let mut vectors = vec![Vec::new(); texts.len()];
+        // Pool one bounded batch before the next; FastEmbed retains raw token
+        // outputs for all batches passed to a single embed() call.
+        for batch in order.chunks(EMBEDDING_BATCH_SIZE) {
+            let batch_vectors = if queries {
+                let inputs: Vec<_> = batch
+                    .iter()
+                    .map(|&index| format!("{}{}", CONFIG.query_instruction, texts[index]))
+                    .collect();
+                self.model.embed(inputs, None)?
+            } else {
+                let inputs: Vec<_> = batch.iter().map(|&index| texts[index]).collect();
+                self.model.embed(inputs, None)?
+            };
             validate_output(&batch_vectors, batch.len())?;
-            vectors.extend(batch_vectors);
+            for (&index, vector) in batch.iter().zip(batch_vectors) {
+                vectors[index] = vector;
+            }
         }
         Ok(vectors)
     }

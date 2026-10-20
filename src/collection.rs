@@ -230,7 +230,7 @@ impl Collection {
     }
 
     /// Batch query embedding, then retrieve each ranking in input order with
-    /// reusable BM25 scratch. Blank inputs reject the batch before inference.
+    /// reusable search scratch. Blank inputs reject the batch before inference.
     pub fn search_many(
         &mut self,
         queries: &[&str],
@@ -246,6 +246,27 @@ impl Collection {
                     .search_with_scratch(query, &vector, options, &mut scratch)
             })
             .collect()
+    }
+
+    /// Batch embedding followed by bounded parallel retrieval. Rankings retain
+    /// input order. Embedding inference completes before retrieval workers start.
+    pub fn search_many_with_workers(
+        &mut self,
+        queries: &[&str],
+        options: HybridSearchOptions,
+        workers: std::num::NonZeroUsize,
+    ) -> Result<Vec<Vec<ChunkHit>>, CollectionError> {
+        if workers.get() == 1 {
+            return self.search_many(queries, options);
+        }
+        let vectors = self.embed_queries(queries)?;
+        let inputs: Vec<_> = queries
+            .iter()
+            .zip(&vectors)
+            .map(|(&query, vector)| (query, vector.as_slice()))
+            .collect();
+        self.retrieval
+            .search_many_with_vectors(&inputs, options, workers)
     }
 
     /// Read-only retrieval with a precomputed query embedding. The vector must
