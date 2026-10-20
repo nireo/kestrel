@@ -60,7 +60,31 @@ pub struct IvfIndex {
     offsets: Vec<usize>,
     vectors: Vec<f32>,
     doc_ids: Vec<DocId>,
-    positions: HashMap<DocId, usize>,
+    positions: Positions,
+}
+
+#[derive(Debug)]
+enum Positions {
+    Dense(Vec<usize>),
+    Sparse(HashMap<DocId, usize>),
+}
+
+impl Positions {
+    fn insert(&mut self, id: DocId, row: usize) {
+        match self {
+            Self::Dense(rows) => rows[id as usize] = row,
+            Self::Sparse(rows) => {
+                rows.insert(id, row);
+            }
+        }
+    }
+
+    fn get(&self, id: DocId) -> Option<usize> {
+        match self {
+            Self::Dense(rows) => rows.get(id as usize).copied(),
+            Self::Sparse(rows) => rows.get(&id).copied(),
+        }
+    }
 }
 
 impl IvfIndex {
@@ -90,7 +114,7 @@ impl IvfIndex {
                 offsets: vec![0],
                 vectors: Vec::new(),
                 doc_ids: Vec::new(),
-                positions: HashMap::new(),
+                positions: Positions::Dense(Vec::new()),
             });
         }
 
@@ -112,7 +136,13 @@ impl IvfIndex {
         let mut cursors = offsets[..clusters].to_vec();
         let mut vectors = vec![0.0; count * dimensions];
         let mut doc_ids = vec![0; count];
-        let mut positions = HashMap::with_capacity(count);
+        // Unique IDs below count are exactly a permutation of 0..count. Sparse
+        // external IDs retain a map rather than allocating up to the largest ID.
+        let mut positions = if (0..count).all(|row| (row_at(row).0 as usize) < count) {
+            Positions::Dense(vec![0; count])
+        } else {
+            Positions::Sparse(HashMap::with_capacity(count))
+        };
         for (row, cluster) in assignments.into_iter().enumerate() {
             let (id, vector) = row_at(row);
             let destination = cursors[cluster];
@@ -148,7 +178,7 @@ impl IvfIndex {
 
     /// Borrow an original normalized vector by its stable document ID.
     pub fn vector(&self, doc_id: DocId) -> Option<&[f32]> {
-        let row = *self.positions.get(&doc_id)?;
+        let row = self.positions.get(doc_id)?;
         let start = row * self.dimensions;
         Some(&self.vectors[start..start + self.dimensions])
     }

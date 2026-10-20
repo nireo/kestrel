@@ -222,3 +222,33 @@ fn hybrid_with_all_probes_matches_exact_hybrid_including_zero_limits() {
         }
     }
 }
+
+#[test]
+fn dense_permutations_and_sparse_ids_preserve_vector_lookup_after_reordering() {
+    for ids in [vec![2, 0, 3, 1], vec![u32::MAX, 42, 0, 7]] {
+        let mut source = VectorIndex::new(2).unwrap();
+        for (row, &id) in ids.iter().enumerate() {
+            source.insert(id, &[row as f32 - 2.0, 1.0]).unwrap();
+        }
+        let index = IvfIndex::build(
+            &source,
+            IvfBuildOptions {
+                clusters: 2,
+                training_samples: 4,
+                iterations: 3,
+                ..IvfBuildOptions::default()
+            },
+        )
+        .unwrap();
+        for &id in &ids {
+            assert_eq!(index.vector(id), source.vector(id));
+        }
+        for id in [4, 5, 100] {
+            assert!(index.vector(id).is_none());
+        }
+        assert_eq!(
+            index.search(&[1.0, 0.0], 10, usize::MAX).unwrap(),
+            source.search(&[1.0, 0.0], 10).unwrap()
+        );
+    }
+}

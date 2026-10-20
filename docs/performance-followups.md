@@ -97,3 +97,22 @@ Exact query latency was unchanged (33.288 vs 33.295 ms per 64 queries). IVF took
 4.640 vs 4.520 ms; this is a modest timing difference, not a large speedup.
 Combined with the first two changes, exact queries took 32.410 ms and IVF took
 4.566 ms, with the same allocation reductions.
+
+## 4. use dense IVF row positions
+
+An IVF build with unique IDs in 0..count stores destination rows in a Vec<usize>.
+This accepts any insertion permutation and preserves cluster reordering. Sparse
+IDs keep their existing HashMap and never allocate up to an arbitrary maximum ID.
+
+```rust
+match self {
+    Self::Dense(rows) => rows.get(id as usize).copied(),
+    Self::Sparse(rows) => rows.get(&id).copied(),
+}
+```
+
+Measured alone: one million lookups fell from 6.792 to 1.451 ms (4.68×). IVF
+construction was effectively unchanged (16.737 vs 16.674 ms). A 10,000-row index
+retained 198,536 fewer bytes (about 194 KiB). With the first four changes combined,
+lookups took 1.477 ms and build time was 16.954 ms. This optimizes access by ID;
+it does not reduce the number of vectors scored during an IVF query.
