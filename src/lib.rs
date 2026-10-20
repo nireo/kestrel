@@ -151,6 +151,10 @@ impl InvertedIndex {
 }
 
 impl LexicalIndex {
+    pub(crate) fn reserve(&mut self, additional: usize) {
+        self.document_lengths.reserve(additional);
+    }
+
     pub(crate) fn check_capacity(&self, additional: usize) -> Result<(), IndexError> {
         let count = self
             .len()

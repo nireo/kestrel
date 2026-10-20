@@ -41,6 +41,13 @@ pub(crate) struct CollectionData {
 }
 
 impl CollectionData {
+    fn reserve(&mut self, documents: usize, chunks: usize) {
+        self.documents.reserve(documents);
+        self.chunks.reserve(chunks);
+        self.bm25.reserve(chunks);
+        self.vectors.reserve(chunks);
+    }
+
     pub(crate) fn new(dimensions: usize) -> Result<Self, VectorError> {
         Ok(Self {
             documents: Vec::new(),
@@ -104,6 +111,7 @@ impl CollectionData {
             .iter()
             .map(|text| LexicalIndex::prepare(text))
             .collect::<Result<Vec<_>, _>>()?;
+        self.reserve(batch.len(), chunk_count);
         // No fallible preparation may occur after this callback. For persistent
         // collections it appends and syncs the transaction before publishing it.
         persist(batch)?;
@@ -196,6 +204,12 @@ pub struct RetrievalCollection {
 }
 
 impl RetrievalCollection {
+    /// Reserve storage for an expected number of additional documents and
+    /// passages. Does not publish data or change either ID namespace.
+    pub fn reserve(&mut self, documents: usize, chunks: usize) {
+        self.data.reserve(documents, chunks);
+    }
+
     /// Record the embedding space and chunking provenance for persistence
     /// compatibility. Token counts and model identity cannot be verified from
     /// supplied vectors; the caller must prepare passages using these settings.

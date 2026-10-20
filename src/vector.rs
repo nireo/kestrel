@@ -48,6 +48,26 @@ impl VectorIndex {
         })
     }
 
+    /// Allocate storage for a known number of vectors up front. As with Vec,
+    /// an overflowing or unallocatable capacity panics.
+    pub fn with_capacity(dimensions: usize, capacity: usize) -> Result<Self, VectorError> {
+        let mut index = Self::new(dimensions)?;
+        index.reserve(capacity);
+        Ok(index)
+    }
+
+    /// Reserve room for additional rows without changing IDs or indexed data.
+    pub fn reserve(&mut self, additional: usize) {
+        let components = additional
+            .checked_mul(self.dimensions)
+            .expect("vector capacity overflow");
+        self.vectors.reserve(components);
+        self.doc_ids.reserve(additional);
+        if let Some(positions) = &mut self.positions {
+            positions.reserve(additional);
+        }
+    }
+
     pub fn dimensions(&self) -> usize {
         self.dimensions
     }

@@ -89,6 +89,13 @@ impl CollectionVectors {
         }
     }
 
+    pub(crate) fn reserve(&mut self, additional: usize) {
+        match self {
+            Self::Exact(index) => index.reserve(additional),
+            Self::Ivf { buffer, .. } => buffer.reserve(additional),
+        }
+    }
+
     pub(crate) fn search(
         &self,
         query: &[f32],
@@ -129,7 +136,7 @@ impl CollectionVectors {
                     return Ok(());
                 }
 
-                let mut exact = VectorIndex::new(self.dimensions())?;
+                let mut exact = VectorIndex::with_capacity(self.dimensions(), self.len())?;
                 for row in 0..self.len() {
                     let id = row as DocId;
                     exact.append_normalized(

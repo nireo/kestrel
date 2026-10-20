@@ -282,7 +282,7 @@ fn run(config: &Config, count: usize) -> Result<Run, Error> {
     );
     let peak_rss_before_build_bytes = peak_rss_bytes();
     let mut bm25 = InvertedIndex::new();
-    let mut vectors = VectorIndex::new(header.dimensions)?;
+    let mut vectors = VectorIndex::with_capacity(header.dimensions, header.document_count)?;
     let mut bm25_build = Duration::ZERO;
     let mut vector_build = Duration::ZERO;
     let mut text_bytes = 0;

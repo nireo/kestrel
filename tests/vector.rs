@@ -70,6 +70,23 @@ fn consecutive_ids_fall_back_to_sparse_lookup_without_changing_rows() {
 }
 
 #[test]
+fn reservation_preserves_sparse_ids_vectors_and_validation() {
+    assert!(matches!(
+        VectorIndex::with_capacity(0, 100),
+        Err(VectorError::ZeroDimensions)
+    ));
+    let mut index = VectorIndex::with_capacity(2, 100).unwrap();
+    assert!(index.is_empty());
+    index.insert(7, &[3.0, 4.0]).unwrap();
+    index.insert(2, &[0.0, 1.0]).unwrap();
+    let before = index.search(&[1.0, 0.0], 10).unwrap();
+    index.reserve(1000);
+    assert_eq!(index.search(&[1.0, 0.0], 10).unwrap(), before);
+    assert!(index.insert(7, &[1.0, 0.0]).is_err());
+    assert_eq!(index.len(), 2);
+}
+
+#[test]
 fn positive_scaling_of_documents_and_queries_does_not_change_ranking() {
     let mut index = VectorIndex::new(2).unwrap();
     index.insert(9, &[3.0, 4.0]).unwrap();
