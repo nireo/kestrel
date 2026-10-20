@@ -294,3 +294,102 @@ fn retrieval_supports_concurrent_readers() {
         }
     });
 }
+
+#[test]
+fn full_workspace_preserves_rankings_across_modes_limits_errors_and_readers() {
+    let mut scratch = kestrel::SearchScratch::default();
+    let options = HybridSearchOptions::default();
+    for mode in [
+        VectorSearchMode::Exact,
+        ivf_mode(),
+        VectorSearchMode::Ivf {
+            build: IvfBuildOptions {
+                clusters: 2,
+                ..IvfBuildOptions::default()
+            },
+            probes: 1,
+        },
+    ] {
+        let mut core = collection();
+        core.add_documents(vec![
+            single("rust café", [1.0, 0.0]),
+            single("search", [0.0, 1.0]),
+        ])
+        .unwrap();
+        core.set_vector_search_mode(mode).unwrap();
+        core.add_document(single("fresh rust", [-1.0, 0.0]))
+            .unwrap();
+        let held = core
+            .search_with_scratch("rust", &[1.0, 0.0], options, &mut scratch)
+            .unwrap();
+        for (depth, limit) in [(50, 10), (0, 10), (50, 0), (1, 1), (usize::MAX, usize::MAX)] {
+            let options = HybridSearchOptions {
+                candidate_depth: depth,
+                limit,
+            };
+            for q in ["RUST rust", "CAFÉ", "missing", "search"] {
+                let expected = core.search_with_vector(q, &[1.0, 0.0], options).unwrap();
+                assert_eq!(
+                    core.search_with_scratch(q, &[1.0, 0.0], options, &mut scratch)
+                        .unwrap(),
+                    expected
+                );
+                for vector in [vec![0.0, 0.0], vec![1.0], vec![f32::NAN, 1.0]] {
+                    assert!(
+                        core.search_with_scratch(q, &vector, options, &mut scratch)
+                            .is_err()
+                    );
+                }
+                assert!(
+                    core.search_with_scratch(" ", &[1.0, 0.0], options, &mut scratch)
+                        .is_err()
+                );
+            }
+        }
+        assert_eq!(
+            held,
+            core.search_with_vector("rust", &[1.0, 0.0], options)
+                .unwrap()
+        );
+        core.rebuild_vector_index().unwrap();
+        assert_eq!(
+            core.search_with_scratch("rust", &[1.0, 0.0], options, &mut scratch)
+                .unwrap(),
+            core.search_with_vector("rust", &[1.0, 0.0], options)
+                .unwrap()
+        );
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let core = &core;
+                scope.spawn(move || {
+                    let mut scratch = kestrel::SearchScratch::default();
+                    assert_eq!(
+                        core.search_with_scratch("search", &[0.0, 1.0], options, &mut scratch)
+                            .unwrap(),
+                        core.search_with_vector("search", &[0.0, 1.0], options)
+                            .unwrap()
+                    );
+                });
+            }
+        });
+    }
+    let mut other = RetrievalCollection::new(
+        EmbeddingConfig {
+            dimensions: 3,
+            ..CONFIG
+        },
+        ChunkingConfig::default(),
+    )
+    .unwrap();
+    other
+        .add_document(prepared("new", vec![0..3], vec![vec![1.0, 0.0, 0.0]]))
+        .unwrap();
+    assert_eq!(
+        other
+            .search_with_scratch("new", &[1.0, 0.0, 0.0], options, &mut scratch)
+            .unwrap(),
+        other
+            .search_with_vector("new", &[1.0, 0.0, 0.0], options)
+            .unwrap()
+    );
+}

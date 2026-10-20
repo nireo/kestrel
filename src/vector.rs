@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 
-use crate::{DocId, SearchHit, top_k};
+use crate::{DocId, RankedHit, SearchHit, top_k, top_k_into};
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum VectorError {
@@ -159,8 +161,21 @@ impl VectorIndex {
 
     /// Internal retrieval after the caller has validated and normalized the query.
     pub(crate) fn search_normalized(&self, query: &[f32], limit: usize) -> Vec<SearchHit> {
-        let hits = self
-            .vectors
+        top_k(self.hits(query), limit)
+    }
+
+    pub(crate) fn search_normalized_into(
+        &self,
+        query: &[f32],
+        limit: usize,
+        heap: &mut BinaryHeap<Reverse<RankedHit>>,
+        output: &mut Vec<SearchHit>,
+    ) {
+        top_k_into(self.hits(query), limit, heap, output);
+    }
+
+    fn hits<'a>(&'a self, query: &'a [f32]) -> impl Iterator<Item = SearchHit> + 'a {
+        self.vectors
             .chunks_exact(self.dimensions)
             .zip(&self.doc_ids)
             .map(|(vector, &doc_id)| {
@@ -171,8 +186,7 @@ impl VectorIndex {
                     // Stored f32 unit vectors can round slightly outside [-1, 1].
                     score: score.clamp(-1.0, 1.0),
                 }
-            });
-        top_k(hits, limit)
+            })
     }
 
     pub(crate) fn normalize(&self, vector: &[f32]) -> Result<Vec<f32>, VectorError> {
@@ -207,6 +221,21 @@ pub(crate) fn dot(a: &[f32], b: &[f32]) -> f64 {
         .map(|(&a, &b)| f64::from(a) * f64::from(b))
         .sum();
     sums.into_iter().sum::<f64>() + tail
+}
+
+pub(crate) fn normalize_into(
+    vector: &[f32],
+    dimensions: usize,
+    output: &mut Vec<f32>,
+) -> Result<(), VectorError> {
+    let length = vector_length(vector, dimensions)?;
+    output.clear();
+    output.extend(
+        vector
+            .iter()
+            .map(|&component| (f64::from(component) / length) as f32),
+    );
+    Ok(())
 }
 
 pub(crate) fn normalize(vector: &[f32], dimensions: usize) -> Result<Vec<f32>, VectorError> {

@@ -1,4 +1,4 @@
-use crate::vector::{normalize, normalize_in_place, validate_normalized};
+use crate::vector::{normalize, normalize_in_place, normalize_into, validate_normalized};
 use crate::{
     DocId, IvfBuildOptions, IvfError, IvfIndex, SearchHit, VectorError, VectorIndex, top_k,
 };
@@ -131,6 +131,57 @@ impl CollectionVectors {
                 top_k(base_hits.into_iter().chain(buffer_hits), limit)
             }
         })
+    }
+
+    pub(crate) fn search_into(
+        &self,
+        query: &[f32],
+        limit: usize,
+        scratch: &mut crate::SearchScratch,
+    ) -> Result<(), VectorError> {
+        // Temporarily take the query buffer so the IVF helper can borrow the
+        // rest of the workspace. Return its capacity on success and failure.
+        let mut normalized = std::mem::take(&mut scratch.query);
+        let result = (|| {
+            normalize_into(query, self.dimensions(), &mut normalized)?;
+            match self {
+                Self::Exact(index) => index.search_normalized_into(
+                    &normalized,
+                    limit,
+                    &mut scratch.heap,
+                    &mut scratch.vector_hits,
+                ),
+                Self::Ivf {
+                    index,
+                    buffer,
+                    probes,
+                    ..
+                } => {
+                    index.search_normalized_into(&normalized, limit, *probes, scratch);
+                    if !buffer.is_empty() {
+                        buffer.search_normalized_into(
+                            &normalized,
+                            limit,
+                            &mut scratch.heap,
+                            &mut scratch.buffer_hits,
+                        );
+                        crate::top_k_into(
+                            scratch
+                                .vector_hits
+                                .drain(..)
+                                .chain(scratch.buffer_hits.drain(..)),
+                            limit,
+                            &mut scratch.heap,
+                            &mut scratch.selected,
+                        );
+                        std::mem::swap(&mut scratch.vector_hits, &mut scratch.selected);
+                    }
+                }
+            }
+            Ok(())
+        })();
+        scratch.query = normalized;
+        result
     }
 
     pub(crate) fn set_mode(&mut self, mode: VectorSearchMode) -> Result<(), IvfError> {

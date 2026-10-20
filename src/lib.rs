@@ -71,6 +71,22 @@ pub struct Bm25Scratch {
     touched: Vec<DocId>,
 }
 
+/// Reusable workspace for one collection reader, including BM25, normalized
+/// query vectors, candidate lists, and top-k selection. Keep one per reader;
+/// collection searches stay read-only. Returned results remain independently owned.
+#[derive(Debug, Default)]
+pub struct SearchScratch {
+    bm25: Bm25Scratch,
+    query: Vec<f32>,
+    bm25_hits: Vec<SearchHit>,
+    vector_hits: Vec<SearchHit>,
+    buffer_hits: Vec<SearchHit>,
+    clusters: Vec<SearchHit>,
+    candidates: Vec<HybridHit>,
+    selected: Vec<SearchHit>,
+    heap: BinaryHeap<Reverse<RankedHit>>,
+}
+
 /// Scoring data shared by standalone document search and collection chunks.
 /// It owns no source text. IDs are dense row numbers chosen by insertion order.
 #[derive(Debug, Default)]
@@ -265,10 +281,31 @@ impl LexicalIndex {
         limit: usize,
         scratch: &mut Bm25Scratch,
     ) -> Vec<SearchHit> {
-        scratch.seen.clear();
         if limit == 0 || self.total_tokens == 0 {
             return Vec::new();
         }
+        self.score_with_scratch(query, scratch);
+        top_k(scratch_hits(scratch), limit)
+    }
+
+    pub(crate) fn search_into(
+        &self,
+        query: &str,
+        limit: usize,
+        scratch: &mut Bm25Scratch,
+        heap: &mut BinaryHeap<Reverse<RankedHit>>,
+        output: &mut Vec<SearchHit>,
+    ) {
+        output.clear();
+        if limit == 0 || self.total_tokens == 0 {
+            return;
+        }
+        self.score_with_scratch(query, scratch);
+        top_k_into(scratch_hits(scratch), limit, heap, output);
+    }
+
+    fn score_with_scratch(&self, query: &str, scratch: &mut Bm25Scratch) {
+        scratch.seen.clear();
         scratch.normalized.clear();
         if query.is_ascii() {
             scratch.normalized.push_str(query);
@@ -291,13 +328,6 @@ impl LexicalIndex {
                 *score += contribution;
             },
         );
-        top_k(
-            scratch.touched.drain(..).map(|doc_id| {
-                let score = std::mem::replace(&mut scratch.scores[doc_id as usize], 0.0);
-                SearchHit { doc_id, score }
-            }),
-            limit,
-        )
     }
 
     fn accumulate(
@@ -353,6 +383,13 @@ impl LexicalIndex {
     }
 }
 
+fn scratch_hits(scratch: &mut Bm25Scratch) -> impl Iterator<Item = SearchHit> + '_ {
+    scratch.touched.drain(..).map(|doc_id| {
+        let score = std::mem::replace(&mut scratch.scores[doc_id as usize], 0.0);
+        SearchHit { doc_id, score }
+    })
+}
+
 fn tokens(normalized: &str) -> impl Iterator<Item = &str> {
     normalized
         .split(|c: char| !c.is_alphanumeric())
@@ -383,6 +420,36 @@ fn top_k(hits: impl IntoIterator<Item = SearchHit>, limit: usize) -> Vec<SearchH
         .into_iter()
         .map(|hit| hit.0.0)
         .collect()
+}
+
+/// Reuse both selection and output storage; the existing top_k API keeps its
+/// allocation-efficient owned result path for callers without a workspace.
+fn top_k_into(
+    hits: impl IntoIterator<Item = SearchHit>,
+    limit: usize,
+    heap: &mut BinaryHeap<Reverse<RankedHit>>,
+    output: &mut Vec<SearchHit>,
+) {
+    heap.clear();
+    output.clear();
+    if limit == 0 {
+        return;
+    }
+    let hits = hits.into_iter();
+    heap.reserve(limit.min(hits.size_hint().0));
+    for hit in hits {
+        let candidate = Reverse(RankedHit(hit));
+        if heap.len() < limit {
+            heap.push(candidate);
+        } else if candidate < *heap.peek().expect("positive limit") {
+            *heap.peek_mut().expect("positive limit") = candidate;
+        }
+    }
+    output.reserve(heap.len());
+    while let Some(hit) = heap.pop() {
+        output.push(hit.0.0);
+    }
+    output.reverse();
 }
 
 /// Larger means better: higher score, then lower document ID.

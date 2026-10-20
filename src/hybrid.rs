@@ -50,6 +50,29 @@ pub fn reciprocal_rank_fusion(
     }
 
     let mut candidates = Vec::with_capacity(bm25_hits.len() + vector_hits.len());
+    collect_candidates(bm25_hits, vector_hits, &mut candidates);
+
+    // Candidates are in ID order, so their row numbers preserve ID tie order.
+    let best = top_k(
+        candidates.iter().enumerate().map(|(row, hit)| SearchHit {
+            doc_id: row as DocId,
+            score: hit.score,
+        }),
+        limit,
+    );
+
+    best.into_iter()
+        .map(|hit| candidates[hit.doc_id as usize])
+        .collect()
+}
+
+pub(crate) fn collect_candidates(
+    bm25_hits: &[SearchHit],
+    vector_hits: &[SearchHit],
+    candidates: &mut Vec<HybridHit>,
+) {
+    candidates.clear();
+    candidates.reserve(bm25_hits.len() + vector_hits.len());
     for (hits, is_bm25) in [(bm25_hits, true), (vector_hits, false)] {
         for (position, hit) in hits.iter().enumerate() {
             let rank = position + 1;
@@ -76,24 +99,11 @@ pub fn reciprocal_rank_fusion(
         }
         true
     });
-    for hit in &mut candidates {
+    for hit in candidates.iter_mut() {
         for rank in [hit.bm25_rank, hit.vector_rank].into_iter().flatten() {
             hit.score += 1.0 / (RRF_K + rank as f64);
         }
     }
-
-    // Candidates are in ID order, so their row numbers preserve ID tie order.
-    let best = top_k(
-        candidates.iter().enumerate().map(|(row, hit)| SearchHit {
-            doc_id: row as DocId,
-            score: hit.score,
-        }),
-        limit,
-    );
-
-    best.into_iter()
-        .map(|hit| candidates[hit.doc_id as usize])
-        .collect()
 }
 
 /// Retrieve candidates independently, then fuse them into one ranked list.

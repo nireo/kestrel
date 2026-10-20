@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     Bm25Scratch, ChunkingConfig, CollectionError, DocId, EmbeddingConfig, EmbeddingError,
-    HybridSearchOptions, IndexError, LexicalIndex, VectorError, reciprocal_rank_fusion,
+    HybridSearchOptions, IndexError, LexicalIndex, SearchScratch, VectorError,
+    reciprocal_rank_fusion,
 };
 
 mod vectors;
@@ -172,6 +173,59 @@ impl CollectionData {
                 .collect(),
         )
     }
+    fn search_with_workspace(
+        &self,
+        query: &str,
+        vector: &[f32],
+        options: HybridSearchOptions,
+        scratch: &mut SearchScratch,
+    ) -> Result<Vec<ChunkHit>, VectorError> {
+        let depth = if options.limit == 0 {
+            0
+        } else {
+            options.candidate_depth
+        };
+        self.vectors.search_into(vector, depth, scratch)?;
+        self.bm25.search_into(
+            query,
+            depth,
+            &mut scratch.bm25,
+            &mut scratch.heap,
+            &mut scratch.bm25_hits,
+        );
+        crate::hybrid::collect_candidates(
+            &scratch.bm25_hits,
+            &scratch.vector_hits,
+            &mut scratch.candidates,
+        );
+        crate::top_k_into(
+            scratch
+                .candidates
+                .iter()
+                .enumerate()
+                .map(|(row, hit)| crate::SearchHit {
+                    doc_id: row as DocId,
+                    score: hit.score,
+                }),
+            options.limit,
+            &mut scratch.heap,
+            &mut scratch.selected,
+        );
+        Ok(scratch
+            .selected
+            .iter()
+            .map(|selected| {
+                let hit = scratch.candidates[selected.doc_id as usize];
+                ChunkHit {
+                    chunk_id: ChunkId(hit.doc_id),
+                    doc_id: self.chunks[hit.doc_id as usize].doc_id,
+                    score: hit.score,
+                    bm25_rank: hit.bm25_rank,
+                    vector_rank: hit.vector_rank,
+                }
+            })
+            .collect())
+    }
 }
 
 /// One externally prepared passage and its embedding. The byte range refers
@@ -274,6 +328,23 @@ impl RetrievalCollection {
         Ok(self
             .data
             .search_with_scratch(query, query_vector, options, Some(scratch))?)
+    }
+
+    /// Read-only retrieval reusing normalization, candidate, and selection
+    /// buffers as well as BM25 scores. The returned hits own their storage.
+    pub fn search_with_scratch(
+        &self,
+        query: &str,
+        query_vector: &[f32],
+        options: HybridSearchOptions,
+        scratch: &mut SearchScratch,
+    ) -> Result<Vec<ChunkHit>, CollectionError> {
+        if query.trim().is_empty() {
+            return Err(EmbeddingError::EmptyText { index: 0 }.into());
+        }
+        Ok(self
+            .data
+            .search_with_workspace(query, query_vector, options, scratch)?)
     }
 
     pub fn len(&self) -> usize {

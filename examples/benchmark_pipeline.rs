@@ -6,9 +6,9 @@ use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use kestrel::{
-    Bm25Scratch, ChunkingConfig, EmbeddingConfig, HybridSearchOptions, IvfBuildOptions, IvfIndex,
-    PersistentCollection, PreparedChunk, PreparedDocument, RetrievalCollection, VectorIndex,
-    VectorSearchMode,
+    ChunkingConfig, EmbeddingConfig, HybridSearchOptions, IvfBuildOptions, IvfIndex,
+    PersistentCollection, PreparedChunk, PreparedDocument, RetrievalCollection, SearchScratch,
+    VectorIndex, VectorSearchMode,
 };
 use serde_json::json;
 
@@ -232,11 +232,11 @@ fn main() -> Result<(), Error> {
                 rounds,
                 64,
                 || {
-                    let mut scratch = Bm25Scratch::default();
+                    let mut scratch = SearchScratch::default();
                     for ((q, v), expected) in queries.iter().zip(&query_vectors).zip(&expected) {
                         assert_eq!(
                             &index
-                                .search_with_vector_and_scratch(q, v, options, &mut scratch)
+                                .search_with_scratch(q, v, options, &mut scratch)
                                 .unwrap(),
                             expected
                         );
@@ -247,7 +247,7 @@ fn main() -> Result<(), Error> {
                     for (q, v) in queries.iter().zip(&query_vectors) {
                         black_box(
                             index
-                                .search_with_vector_and_scratch(
+                                .search_with_scratch(
                                     black_box(q),
                                     black_box(v),
                                     options,

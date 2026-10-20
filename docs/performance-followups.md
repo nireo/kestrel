@@ -72,3 +72,28 @@ preallocation, vector construction took 28.053 ms with two allocations and
 154,000,000 live bytes; collection insertion took 5.066 ms. These standalone and
 combined comparisons use separate source snapshots, not just successive timings
 of the cumulative branch.
+
+## 3. reuse the complete query workspace
+
+`SearchScratch` retains the normalized query, BM25/vector candidate arrays, IVF
+routing candidates, fusion candidates, and the bounded selection heap. The new
+`RetrievalCollection::search_with_scratch` returns an independent result Vec;
+`Collection::search_many` also uses this workspace. Existing search APIs retain
+their behavior. Invalid queries preserve reusable buffers without exposing stale
+results. Tests cover every retrieval mode, insertion buffers, cross-index reuse,
+limits, errors, held results, and concurrent independent readers.
+
+```rust
+normalize_into(query, self.dimensions(), &mut normalized)?;
+// select into retained storage instead of creating an owned temporary Vec
+index.search_normalized_into(&normalized, limit,
+    &mut scratch.heap, &mut scratch.vector_hits);
+```
+
+Measured alone: allocations across 64 exact queries fell from 368 to 64 and
+requested bytes from 447,488 to 30,720. IVF allocations fell from 688 to 64 and
+bytes from 527,360 to 30,720. Each query now allocates only its returned result.
+Exact query latency was unchanged (33.288 vs 33.295 ms per 64 queries). IVF took
+4.640 vs 4.520 ms; this is a modest timing difference, not a large speedup.
+Combined with the first two changes, exact queries took 32.410 ms and IVF took
+4.566 ms, with the same allocation reductions.

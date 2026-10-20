@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::vector::{dot, normalize};
-use crate::{DocId, SearchHit, VectorError, VectorIndex, top_k};
+use crate::{DocId, SearchHit, VectorError, VectorIndex, top_k, top_k_into};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IvfBuildOptions {
@@ -226,6 +226,58 @@ impl IvfIndex {
         });
 
         top_k(hits, limit)
+    }
+    pub(crate) fn search_normalized_into(
+        &self,
+        query: &[f32],
+        limit: usize,
+        probes: usize,
+        scratch: &mut crate::SearchScratch,
+    ) {
+        scratch.vector_hits.clear();
+        if limit == 0 || self.is_empty() {
+            return;
+        }
+        if probes >= self.cluster_count() {
+            top_k_into(
+                self.vectors
+                    .chunks_exact(self.dimensions)
+                    .zip(&self.doc_ids)
+                    .map(|(vector, &doc_id)| SearchHit {
+                        doc_id,
+                        score: dot(vector, query).clamp(-1.0, 1.0),
+                    }),
+                limit,
+                &mut scratch.heap,
+                &mut scratch.vector_hits,
+            );
+            return;
+        }
+        top_k_into(
+            self.centroids
+                .chunks_exact(self.dimensions)
+                .enumerate()
+                .map(|(cluster, centroid)| SearchHit {
+                    doc_id: cluster as DocId,
+                    score: dot(centroid, query),
+                }),
+            probes,
+            &mut scratch.heap,
+            &mut scratch.clusters,
+        );
+        let hits = scratch.clusters.iter().flat_map(|hit| {
+            let cluster = hit.doc_id as usize;
+            let start = self.offsets[cluster];
+            let end = self.offsets[cluster + 1];
+            self.vectors[start * self.dimensions..end * self.dimensions]
+                .chunks_exact(self.dimensions)
+                .zip(&self.doc_ids[start..end])
+                .map(move |(vector, &doc_id)| SearchHit {
+                    doc_id,
+                    score: dot(vector, query).clamp(-1.0, 1.0),
+                })
+        });
+        top_k_into(hits, limit, &mut scratch.heap, &mut scratch.vector_hits);
     }
 }
 

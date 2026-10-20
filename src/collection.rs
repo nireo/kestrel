@@ -237,13 +237,13 @@ impl Collection {
         options: HybridSearchOptions,
     ) -> Result<Vec<Vec<ChunkHit>>, CollectionError> {
         let vectors = self.embed_queries(queries)?;
-        let mut scratch = crate::Bm25Scratch::default();
+        let mut scratch = crate::SearchScratch::default();
         queries
             .iter()
             .zip(vectors)
             .map(|(query, vector)| {
                 self.retrieval
-                    .search_with_vector_and_scratch(query, &vector, options, &mut scratch)
+                    .search_with_scratch(query, &vector, options, &mut scratch)
             })
             .collect()
     }
