@@ -157,3 +157,92 @@ cargo run --release --offline --example benchmark_embedding_batches -- 3
 
 Raw results: `target/profile-pass/final-batch-*.jsonl` and
 `target/profile-pass/embedding-combined-*.jsonl`.
+
+## persistence size preflight
+
+A bounded `std::io::Write` adapter prevented oversized allocations but slowed
+ordinary vector-heavy encoding substantially: roughly 0.009–0.027 ms became
+0.085–0.103 ms for 64 passages. A direct Postcard output adapter and a variant
+checking limits only on buffer growth were also slower. Those implementations
+are rejected; raw probes remain in `target/profile-pass/encoding-*.log`.
+
+The retained implementation computes the serialized size before writing and
+reserves the necessary output capacity once. Its private callers are owned
+headers and prepared documents with deterministic derived serializers; no
+custom serialization API is exposed. It keeps the existing Postcard byte
+format, size limits, sync behavior, and failure/publication rules.
+
+```rust
+let size = postcard::experimental::serialized_size(value)?;
+if size > limit {
+    return Err(StorageError::RecordTooLarge { max_bytes: limit });
+}
+if size > bytes.capacity() {
+    let capacity = size.max(bytes.capacity().saturating_mul(2)).min(limit);
+    bytes.reserve_exact(capacity); // bytes was cleared before the size pass
+}
+postcard::to_io(value, &mut *bytes)?;
+```
+
+| encoding probe | original | size preflight |
+| --- | ---: | ---: |
+| 64 passages × 384 floats, warmed encoding | 8.353 µs | 8.510 µs |
+| same record, output buffer capacity | 147,456 bytes | 99,713 bytes |
+| rejected 72 MiB string, warmed encoding | 1.42 ms | <0.001 ms |
+| rejected string, output buffer capacity | 75,497,476 bytes | 0 bytes |
+
+Normal encoding time is effectively unchanged; the main benefit is avoiding
+allocation and copying of an oversized encoded record. The input documents and
+lexical preparation still have their own storage. Tiny-string timing is below
+one microsecond and too variable for a useful speedup claim. Rejection is
+measured directly with a smaller generic fixture rather than running expensive
+lexical preparation on a 72 MiB document. Tests cover exact limits, zero limits,
+reusing a buffer after rejection, serialization errors, and wire-format
+identity; the existing truncation, checksum, and durability tests also pass.
+
+Normal document encoding uses three processes with five measured rounds and
+1,000 operations per round. The oversized probe uses five baseline copies per
+round and one million preflight rejections per round to resolve the much
+shorter operation. Inputs/results pass through `black_box`; construction and
+initial buffer growth are outside the reported warmed medians. The two paths
+are in the same test binary. The source includes this opt-in release probe:
+
+```sh
+cargo test --release --offline --lib benchmark_record_encoding_limits -- --ignored --nocapture
+```
+
+Final interleaved storage check, separating ingestion changes from preflight:
+
+| workload | baseline ms | ingestion only ms | ingestion + preflight ms |
+| --- | ---: | ---: | ---: |
+| durable append, 4,096 passages / 64 transactions | 261.769 | 260.571 | 261.459 |
+| warm reopen, 4,096 passages | 9.472 | 8.730 | 8.935 |
+
+Append timings are indistinguishable at this scale. Reopen varied enough
+between trials and earlier runs that no speedup is claimed. Per-append
+allocation requests fall from 21,703 to 17,662 across the complete pass.
+The earlier bounded-writer run was about 5% slower on append and was not kept.
+Raw final results: `target/profile-pass/{base,reuse,preflight}-storage-*.jsonl`.
+
+## remaining bottlenecks and validation
+
+The evidence points to vector scans, model inference, and sync waits as the
+remaining major costs. Further single-query work should start with a dedicated
+vector-kernel profile and recall/latency measurements for IVF settings. More
+scratch-buffer tuning is unlikely to change exact-query latency much. Larger
+write batches can amortize sync cost through the existing batch API; this pass
+does not weaken durability or change write acknowledgement.
+
+The complete pass also reran the original query mix: exact 33.531 → 33.484 ms
+and IVF 4.764 → 4.795 ms for 64 queries, effectively unchanged. A later combined
+ingestion check gave 5.281 → 5.089 ms (short), 28.838 → 16.389 ms (distinct),
+and 10.315 → 9.660 ms (repeated), consistent with the isolated experiments.
+These rows were measured independently of the embedding and storage runs.
+
+Validation: 102 ordinary tests, seven cached real-model tests, the opt-in
+serialization probe, `cargo fmt --check`, and Clippy with `-D warnings` pass.
+Batch benchmark setup independently checks exact and IVF results against
+single-query retrieval; real-model probes check embedding alignment and float
+error across batch regrouping. CPU timing, allocator probes, and sampling were
+run separately. Existing README edits and the earlier untracked performance
+report were left untouched.

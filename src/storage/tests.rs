@@ -360,3 +360,115 @@ fn reused_payload_buffers_keep_wire_format_and_do_not_retain_large_records() {
     assert_eq!(reopened.retrieval().document(1), Some("small"));
     assert!(reopened.buffer.capacity() <= MAX_RETAINED_BYTES);
 }
+
+#[test]
+fn encoding_preflights_limits_before_growing_and_preserves_errors() {
+    let mut fresh = Vec::new();
+    assert!(encode_into(&"too large", 2, &mut fresh).is_err());
+    assert_eq!(fresh.capacity(), 0);
+    encode_into(&(), 0, &mut fresh).unwrap();
+    assert!(fresh.is_empty());
+    let text = "abcdef";
+    let expected = postcard::to_stdvec(&text).unwrap();
+    let mut bytes = Vec::new();
+    encode_into(&text, expected.len(), &mut bytes).unwrap();
+    assert_eq!(bytes, expected);
+    for limit in [0, 1, expected.len() - 1] {
+        assert!(
+            matches!(encode_into(&text, limit, &mut bytes), Err(StorageError::RecordTooLarge { max_bytes }) if max_bytes == limit)
+        );
+        assert!(bytes.len() <= limit);
+        assert_eq!(bytes.capacity(), expected.len());
+    }
+    encode_into(&text, expected.len(), &mut bytes).unwrap();
+    assert_eq!(bytes, expected);
+    let many = vec![1_u8; 500];
+    assert!(encode_into(&many, 299, &mut bytes).is_err());
+    assert_eq!(bytes.capacity(), expected.len());
+    struct Invalid;
+    impl Serialize for Invalid {
+        fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+            Err(serde::ser::Error::custom(
+                "intentional serialization failure",
+            ))
+        }
+    }
+    assert!(matches!(
+        encode_into(&Invalid, 299, &mut bytes),
+        Err(StorageError::Codec(_))
+    ));
+}
+
+#[test]
+#[ignore = "release-mode microbenchmark for serialization limits"]
+fn benchmark_record_encoding_limits() {
+    use std::{hint::black_box, time::Instant};
+    let mut documents = vec![document("a normal passage", [1.0, 0.0]); 64];
+    for document in &mut documents {
+        document.chunks[0].embedding = vec![0.5; 384];
+    }
+    for bounded in [false, true] {
+        let mut bytes = Vec::new();
+        let mut samples = Vec::new();
+        for round in 0..6 {
+            let start = Instant::now();
+            for _ in 0..1000 {
+                if bounded {
+                    encode_into(black_box(&documents), MAX_BATCH_BYTES, &mut bytes).unwrap();
+                } else {
+                    bytes.clear();
+                    postcard::to_io(black_box(&documents), &mut bytes).unwrap();
+                }
+                black_box(&bytes);
+            }
+            if round > 0 {
+                samples.push(start.elapsed().as_secs_f64());
+            }
+        }
+        samples.sort_by(f64::total_cmp);
+        println!(
+            "encoding documents bounded={bounded} median_ms={} capacity={}",
+            samples[samples.len() / 2],
+            bytes.capacity()
+        );
+    }
+
+    for (name, size, limit, iterations) in [
+        ("normal", 16 * 1024, MAX_BATCH_BYTES, 10000),
+        ("oversized", 72 * 1024 * 1024, MAX_BATCH_BYTES, 5),
+    ] {
+        let value = "x".repeat(size);
+        for bounded in [false, true] {
+            let iterations = if bounded && size > limit {
+                1_000_000
+            } else {
+                iterations
+            };
+            let mut bytes = Vec::new();
+            let mut samples = Vec::new();
+            for round in 0..6 {
+                let start = Instant::now();
+                for _ in 0..iterations {
+                    if bounded {
+                        let result = encode_into(black_box(&value), limit, &mut bytes);
+                        assert_eq!(result.is_err(), size > limit);
+                    } else {
+                        bytes.clear();
+                        postcard::to_io(black_box(&value), &mut bytes).unwrap();
+                        black_box(bytes.len() > limit);
+                    }
+                    black_box(&bytes);
+                }
+                if round > 0 {
+                    samples.push(start.elapsed().as_secs_f64() * 1000.0 / iterations as f64);
+                }
+            }
+            samples.sort_by(f64::total_cmp);
+            println!(
+                "encoding {name} bounded={bounded} median_ms={} capacity={}",
+                samples[samples.len() / 2],
+                bytes.capacity()
+            );
+        }
+    }
+}

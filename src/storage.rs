@@ -317,10 +317,18 @@ fn encode_into(
     bytes: &mut Vec<u8>,
 ) -> Result<(), StorageError> {
     bytes.clear();
-    postcard::to_io(value, &mut *bytes)?;
-    if bytes.len() > limit {
+    let size = postcard::experimental::serialized_size(value)?;
+    if size > limit {
         return Err(StorageError::RecordTooLarge { max_bytes: limit });
     }
+    // These private callers serialize plain owned headers and documents. Their
+    // derived serializers are deterministic across the size and output passes.
+    if size > bytes.capacity() {
+        let capacity = size.max(bytes.capacity().saturating_mul(2)).min(limit);
+        bytes.reserve_exact(capacity);
+    }
+    postcard::to_io(value, &mut *bytes)?;
+    debug_assert_eq!(bytes.len(), size);
     Ok(())
 }
 
