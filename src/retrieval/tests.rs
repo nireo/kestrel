@@ -336,3 +336,33 @@ fn collection_supports_shared_readers() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<Collection>();
 }
+
+#[test]
+fn batch_term_counts_match_independent_preparation() {
+    let repeated = "rust ".repeat(300);
+    let texts = [
+        "RUST rust engine",
+        "école école search",
+        "engine",
+        &repeated,
+    ];
+    let mut data = CollectionData::new(2).unwrap();
+    let documents: Vec<_> = texts
+        .iter()
+        .map(|text| PreparedDocument {
+            text: text.to_string(),
+            chunks: vec![PreparedChunk {
+                byte_range: 0..text.len(),
+                embedding: vec![1.0, 0.0],
+            }],
+        })
+        .collect();
+    data.insert_batch(documents, true, |_| Ok(())).unwrap();
+    let mut independent = LexicalIndex::default();
+    for text in texts {
+        independent.append(LexicalIndex::prepare(&text.to_lowercase()).unwrap());
+    }
+    for query in ["rust", "école", "engine search", "missing"] {
+        assert_eq!(data.bm25.search(query, 10), independent.search(query, 10));
+    }
+}

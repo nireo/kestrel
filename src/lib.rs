@@ -97,8 +97,13 @@ pub(crate) struct LexicalIndex {
 }
 
 pub(crate) struct PreparedText<'a> {
-    frequencies: HashMap<&'a str, u32>,
+    frequencies: PreparedFrequencies<'a>,
     length: u32,
+}
+
+enum PreparedFrequencies<'a> {
+    Owned(HashMap<&'a str, u32>),
+    Compact(Vec<(&'a str, u32)>),
 }
 
 impl InvertedIndex {
@@ -185,18 +190,21 @@ impl LexicalIndex {
     /// Borrow counts from a caller-owned lowercase buffer. Prepare all chunks
     /// before committing any, without allocating dictionary keys per document.
     pub(crate) fn prepare(normalized: &str) -> Result<PreparedText<'_>, IndexError> {
-        let mut frequencies = HashMap::<&str, u32>::new();
-        let mut length = 0_u32;
-
-        // Borrow terms from one normalized buffer instead of allocating a
-        // separate String for every token. Repeated tokens share one count.
-        for term in tokens(normalized) {
-            length = length.checked_add(1).ok_or(IndexError::DocumentTooLong)?;
-            *frequencies.entry(term).or_default() += 1;
-        }
-
+        let mut frequencies = HashMap::new();
+        let length = count_terms(normalized, &mut frequencies)?;
         Ok(PreparedText {
-            frequencies,
+            frequencies: PreparedFrequencies::Owned(frequencies),
+            length,
+        })
+    }
+
+    pub(crate) fn prepare_reusing<'a>(
+        normalized: &'a str,
+        frequencies: &mut HashMap<&'a str, u32>,
+    ) -> Result<PreparedText<'a>, IndexError> {
+        let length = count_terms(normalized, frequencies)?;
+        Ok(PreparedText {
+            frequencies: PreparedFrequencies::Compact(frequencies.drain().collect()),
             length,
         })
     }
@@ -204,25 +212,27 @@ impl LexicalIndex {
     pub(crate) fn append(&mut self, prepared: PreparedText<'_>) -> DocId {
         debug_assert!(self.check_capacity(1).is_ok());
         let doc_id = self.len() as DocId;
+        match prepared.frequencies {
+            PreparedFrequencies::Owned(terms) => self.append_terms(doc_id, terms),
+            PreparedFrequencies::Compact(terms) => self.append_terms(doc_id, terms),
+        }
+        self.document_lengths.push(prepared.length);
+        self.total_tokens += u64::from(prepared.length);
+        doc_id
+    }
 
-        for (term, term_frequency) in prepared.frequencies {
+    fn append_terms<'a>(&mut self, doc_id: DocId, terms: impl IntoIterator<Item = (&'a str, u32)>) {
+        for (term, term_frequency) in terms {
             let posting = Posting {
                 doc_id,
                 term_frequency,
             };
-
-            // Allocate a dictionary key only when this term is new to the index.
             if let Some(postings) = self.terms.get_mut(term) {
                 postings.push(posting);
             } else {
                 self.terms.insert(term.into(), vec![posting]);
             }
         }
-
-        // IDs only increase, so every posting list stays sorted without sorting.
-        self.document_lengths.push(prepared.length);
-        self.total_tokens += u64::from(prepared.length);
-        doc_id
     }
 
     pub fn len(&self) -> usize {
@@ -381,6 +391,19 @@ impl LexicalIndex {
             }
         }
     }
+}
+
+fn count_terms<'a>(
+    normalized: &'a str,
+    frequencies: &mut HashMap<&'a str, u32>,
+) -> Result<u32, IndexError> {
+    frequencies.clear();
+    let mut length = 0_u32;
+    for term in tokens(normalized) {
+        length = length.checked_add(1).ok_or(IndexError::DocumentTooLong)?;
+        *frequencies.entry(term).or_default() += 1;
+    }
+    Ok(length)
 }
 
 fn scratch_hits(scratch: &mut Bm25Scratch) -> impl Iterator<Item = SearchHit> + '_ {

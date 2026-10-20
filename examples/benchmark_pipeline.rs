@@ -101,12 +101,21 @@ fn vector(row: usize) -> Vec<f32> {
         .collect()
 }
 fn batches(rows: usize, batch_size: usize) -> Vec<Vec<PreparedDocument>> {
+    passage_batches(rows, batch_size, 0)
+}
+fn passage_batches(rows: usize, batch_size: usize, distinct: usize) -> Vec<Vec<PreparedDocument>> {
     (0..rows)
         .step_by(batch_size)
         .map(|start| {
             (start..(start + batch_size).min(rows))
                 .map(|row| {
-                    let text = format!("search topic{} record{row}", row % 64);
+                    let mut text = format!("search topic{} record{row}", row % 64);
+                    if distinct > 0 {
+                        use std::fmt::Write;
+                        for word in 0..256 {
+                            write!(text, " term{}", (row * 17 + word % distinct) % 1024).unwrap();
+                        }
+                    }
                     let len = text.len();
                     PreparedDocument {
                         text,
@@ -198,6 +207,30 @@ fn main() -> Result<(), Error> {
                 index
             },
         );
+    }
+    if enabled("ingest") {
+        for (name, distinct) in [
+            ("collection_ingest_distinct_2k", 256),
+            ("collection_ingest_repeated_2k", 16),
+        ] {
+            measure(
+                name,
+                rounds,
+                2000,
+                || passage_batches(2000, 256, distinct),
+                |batches| {
+                    let mut index =
+                        RetrievalCollection::new(CONFIG, ChunkingConfig::default()).unwrap();
+                    if reserve {
+                        index.reserve(2000, 2000);
+                    }
+                    for batch in batches {
+                        index.add_documents(batch).unwrap();
+                    }
+                    index
+                },
+            );
+        }
     }
     if enabled("query") {
         let mut index = collection(10_000, reserve);

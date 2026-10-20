@@ -84,13 +84,11 @@ impl CollectionData {
         })?;
         self.bm25.check_capacity(chunk_count)?;
         for document in &mut *batch {
-            let ranges: Vec<_> = document
-                .chunks
-                .iter()
-                .map(|chunk| chunk.byte_range.clone())
-                .collect();
-            validate_document_ranges(&document.text, &ranges)
-                .map_err(CollectionError::InvalidDocument)?;
+            validate_document_ranges(
+                &document.text,
+                document.chunks.iter().map(|chunk| &chunk.byte_range),
+            )
+            .map_err(CollectionError::InvalidDocument)?;
             for chunk in &mut document.chunks {
                 if normalize_vectors {
                     self.vectors.normalize_in_place(&mut chunk.embedding)?;
@@ -108,9 +106,10 @@ impl CollectionData {
                     .map(|chunk| document.text[chunk.byte_range.clone()].to_lowercase())
             })
             .collect();
+        let mut frequencies = std::collections::HashMap::new();
         let lexical = lowercase
             .iter()
-            .map(|text| LexicalIndex::prepare(text))
+            .map(|text| LexicalIndex::prepare_reusing(text, &mut frequencies))
             .collect::<Result<Vec<_>, _>>()?;
         self.reserve(batch.len(), chunk_count);
         // No fallible preparation may occur after this callback. For persistent
@@ -407,14 +406,15 @@ impl RetrievalCollection {
 }
 
 /// Validate before slicing source text or mutating an index.
-pub(crate) fn validate_document_ranges(
+pub(crate) fn validate_document_ranges<'a>(
     text: &str,
-    ranges: &[Range<usize>],
+    ranges: impl IntoIterator<Item = &'a Range<usize>>,
 ) -> Result<(), &'static str> {
     if text.trim().is_empty() {
         return Err("blank document");
     }
-    for (index, range) in ranges.iter().enumerate() {
+    let mut previous: Option<&Range<usize>> = None;
+    for range in ranges {
         if range.start >= range.end
             || text
                 .get(range.clone())
@@ -422,21 +422,19 @@ pub(crate) fn validate_document_ranges(
         {
             return Err("invalid chunk byte range");
         }
-        if index == 0 {
-            if range.start != 0 {
-                return Err("first chunk does not start at zero");
-            }
-        } else {
-            let previous = &ranges[index - 1];
+        if let Some(previous) = previous {
             if range.start <= previous.start
                 || range.end <= previous.end
                 || range.start > previous.end
             {
                 return Err("chunks do not cover document in order");
             }
+        } else if range.start != 0 {
+            return Err("first chunk does not start at zero");
         }
+        previous = Some(range);
     }
-    if ranges.last().is_none_or(|range| range.end != text.len()) {
+    if previous.is_none_or(|range| range.end != text.len()) {
         return Err("chunks do not cover entire document");
     }
     Ok(())
