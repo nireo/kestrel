@@ -207,17 +207,16 @@ pub(crate) fn dot(a: &[f32], b: &[f32]) -> f64 {
     // auto-vectorization. Promote before multiplying to retain f64 precision.
     debug_assert_eq!(a.len(), b.len());
     let mut sums = [0.0_f64; 4];
-    let mut a_chunks = a.chunks_exact(4);
-    let mut b_chunks = b.chunks_exact(4);
-    for (a, b) in a_chunks.by_ref().zip(b_chunks.by_ref()) {
+    let (a_chunks, a_tail) = a.as_chunks::<4>();
+    let (b_chunks, b_tail) = b.as_chunks::<4>();
+    for (a, b) in a_chunks.iter().zip(b_chunks) {
         for lane in 0..4 {
             sums[lane] += f64::from(a[lane]) * f64::from(b[lane]);
         }
     }
-    let tail: f64 = a_chunks
-        .remainder()
+    let tail: f64 = a_tail
         .iter()
-        .zip(b_chunks.remainder())
+        .zip(b_tail)
         .map(|(&a, &b)| f64::from(a) * f64::from(b))
         .sum();
     sums.into_iter().sum::<f64>() + tail
