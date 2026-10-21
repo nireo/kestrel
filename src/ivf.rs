@@ -1,7 +1,9 @@
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
+use std::ops::Range;
 
 use crate::vector::{dot, normalize};
-use crate::{DocId, SearchHit, VectorError, VectorIndex, top_k, top_k_into};
+use crate::{DocId, RankedHit, SearchHit, VectorError, VectorIndex, top_k, top_k_into};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IvfBuildOptions {
@@ -220,94 +222,67 @@ impl IvfIndex {
 
         // All clusters share one contiguous array, so scan it directly.
         if probes >= self.cluster_count() {
-            let hits = self
-                .vectors
-                .chunks_exact(self.dimensions)
-                .zip(&self.doc_ids)
-                .map(|(vector, &doc_id)| SearchHit {
-                    doc_id,
-                    score: dot(vector, query).clamp(-1.0, 1.0),
-                });
-            return top_k(hits, limit);
+            return top_k(self.hits(query, 0..self.len()), limit);
         }
 
-        let clusters = top_k(
-            self.centroids
-                .chunks_exact(self.dimensions)
-                .enumerate()
-                .map(|(cluster, centroid)| SearchHit {
-                    doc_id: cluster as DocId,
-                    score: dot(centroid, query),
-                }),
-            probes,
-        );
-
-        let hits = clusters.into_iter().flat_map(|hit| {
-            let cluster = hit.doc_id as usize;
-            let start = self.offsets[cluster];
-            let end = self.offsets[cluster + 1];
-            self.vectors[start * self.dimensions..end * self.dimensions]
-                .chunks_exact(self.dimensions)
-                .zip(&self.doc_ids[start..end])
-                .map(move |(vector, &doc_id)| SearchHit {
-                    doc_id,
-                    score: dot(vector, query).clamp(-1.0, 1.0),
-                })
-        });
-
-        top_k(hits, limit)
+        let clusters = top_k(self.centroid_hits(query), probes);
+        top_k(self.cluster_hits(query, &clusters), limit)
     }
+
     pub(crate) fn search_normalized_into(
         &self,
         query: &[f32],
         limit: usize,
         probes: usize,
-        scratch: &mut crate::SearchScratch,
+        heap: &mut BinaryHeap<Reverse<RankedHit>>,
+        clusters: &mut Vec<SearchHit>,
+        output: &mut Vec<SearchHit>,
     ) {
-        scratch.vector_hits.clear();
+        output.clear();
         if limit == 0 || self.is_empty() {
             return;
         }
         if probes >= self.cluster_count() {
-            top_k_into(
-                self.vectors
-                    .chunks_exact(self.dimensions)
-                    .zip(&self.doc_ids)
-                    .map(|(vector, &doc_id)| SearchHit {
-                        doc_id,
-                        score: dot(vector, query).clamp(-1.0, 1.0),
-                    }),
-                limit,
-                &mut scratch.heap,
-                &mut scratch.vector_hits,
-            );
+            top_k_into(self.hits(query, 0..self.len()), limit, heap, output);
             return;
         }
-        top_k_into(
-            self.centroids
-                .chunks_exact(self.dimensions)
-                .enumerate()
-                .map(|(cluster, centroid)| SearchHit {
-                    doc_id: cluster as DocId,
-                    score: dot(centroid, query),
-                }),
-            probes,
-            &mut scratch.heap,
-            &mut scratch.clusters,
-        );
-        let hits = scratch.clusters.iter().flat_map(|hit| {
+        top_k_into(self.centroid_hits(query), probes, heap, clusters);
+        top_k_into(self.cluster_hits(query, clusters), limit, heap, output);
+    }
+
+    fn centroid_hits<'a>(&'a self, query: &'a [f32]) -> impl Iterator<Item = SearchHit> + 'a {
+        self.centroids
+            .chunks_exact(self.dimensions)
+            .enumerate()
+            .map(|(cluster, centroid)| SearchHit {
+                doc_id: cluster as DocId,
+                score: dot(centroid, query),
+            })
+    }
+
+    fn hits<'a>(
+        &'a self,
+        query: &'a [f32],
+        rows: Range<usize>,
+    ) -> impl Iterator<Item = SearchHit> + 'a {
+        self.vectors[rows.start * self.dimensions..rows.end * self.dimensions]
+            .chunks_exact(self.dimensions)
+            .zip(&self.doc_ids[rows])
+            .map(|(vector, &doc_id)| SearchHit {
+                doc_id,
+                score: dot(vector, query).clamp(-1.0, 1.0),
+            })
+    }
+
+    fn cluster_hits<'a>(
+        &'a self,
+        query: &'a [f32],
+        clusters: &'a [SearchHit],
+    ) -> impl Iterator<Item = SearchHit> + 'a {
+        clusters.iter().flat_map(|hit| {
             let cluster = hit.doc_id as usize;
-            let start = self.offsets[cluster];
-            let end = self.offsets[cluster + 1];
-            self.vectors[start * self.dimensions..end * self.dimensions]
-                .chunks_exact(self.dimensions)
-                .zip(&self.doc_ids[start..end])
-                .map(move |(vector, &doc_id)| SearchHit {
-                    doc_id,
-                    score: dot(vector, query).clamp(-1.0, 1.0),
-                })
-        });
-        top_k_into(hits, limit, &mut scratch.heap, &mut scratch.vector_hits);
+            self.hits(query, self.offsets[cluster]..self.offsets[cluster + 1])
+        })
     }
 }
 

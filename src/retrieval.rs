@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     Bm25Scratch, ChunkingConfig, CollectionError, DocId, EmbeddingConfig, EmbeddingError,
-    HybridSearchOptions, IndexError, LexicalIndex, SearchScratch, VectorError,
+    HybridHit, HybridSearchOptions, IndexError, LexicalIndex, SearchScratch, VectorError,
     reciprocal_rank_fusion,
 };
 
@@ -149,11 +149,7 @@ impl CollectionData {
         options: HybridSearchOptions,
         scratch: Option<&mut Bm25Scratch>,
     ) -> Result<Vec<ChunkHit>, VectorError> {
-        let depth = if options.limit == 0 {
-            0
-        } else {
-            options.candidate_depth
-        };
+        let depth = options.retrieval_depth();
         let vector_hits = self.vectors.search(query_vector, depth)?;
         let bm25_hits = match scratch {
             Some(scratch) => self.bm25.search_with_scratch(query, depth, scratch),
@@ -162,16 +158,11 @@ impl CollectionData {
         Ok(
             reciprocal_rank_fusion(&bm25_hits, &vector_hits, options.limit)
                 .into_iter()
-                .map(|hit| ChunkHit {
-                    chunk_id: ChunkId(hit.doc_id),
-                    doc_id: self.chunks[hit.doc_id as usize].doc_id,
-                    score: hit.score,
-                    bm25_rank: hit.bm25_rank,
-                    vector_rank: hit.vector_rank,
-                })
+                .map(|hit| self.chunk_hit(hit))
                 .collect(),
         )
     }
+
     fn search_with_workspace(
         &self,
         query: &str,
@@ -193,11 +184,7 @@ impl CollectionData {
         output: &mut Vec<ChunkHit>,
     ) -> Result<(), VectorError> {
         output.clear();
-        let depth = if options.limit == 0 {
-            0
-        } else {
-            options.candidate_depth
-        };
+        let depth = options.retrieval_depth();
         self.vectors.search_into(vector, depth, scratch)?;
         self.bm25.search_into(
             query,
@@ -224,17 +211,23 @@ impl CollectionData {
             &mut scratch.heap,
             &mut scratch.selected,
         );
-        output.extend(scratch.selected.iter().map(|selected| {
-            let hit = scratch.candidates[selected.doc_id as usize];
-            ChunkHit {
-                chunk_id: ChunkId(hit.doc_id),
-                doc_id: self.chunks[hit.doc_id as usize].doc_id,
-                score: hit.score,
-                bm25_rank: hit.bm25_rank,
-                vector_rank: hit.vector_rank,
-            }
-        }));
+        output.extend(
+            scratch
+                .selected
+                .iter()
+                .map(|selected| self.chunk_hit(scratch.candidates[selected.doc_id as usize])),
+        );
         Ok(())
+    }
+
+    fn chunk_hit(&self, hit: HybridHit) -> ChunkHit {
+        ChunkHit {
+            chunk_id: ChunkId(hit.doc_id),
+            doc_id: self.chunks[hit.doc_id as usize].doc_id,
+            score: hit.score,
+            bm25_rank: hit.bm25_rank,
+            vector_rank: hit.vector_rank,
+        }
     }
 }
 

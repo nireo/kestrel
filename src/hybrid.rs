@@ -21,6 +21,16 @@ pub struct HybridSearchOptions {
     pub limit: usize,
 }
 
+impl HybridSearchOptions {
+    pub(crate) fn retrieval_depth(self) -> usize {
+        if self.limit == 0 {
+            0
+        } else {
+            self.candidate_depth
+        }
+    }
+}
+
 impl Default for HybridSearchOptions {
     fn default() -> Self {
         Self {
@@ -120,11 +130,7 @@ pub fn hybrid_search(
     query_vector: &[f32],
     options: HybridSearchOptions,
 ) -> Result<Vec<HybridHit>, VectorError> {
-    let depth = if options.limit == 0 {
-        0
-    } else {
-        options.candidate_depth
-    };
+    let depth = options.retrieval_depth();
 
     // Validate the vector query before spending work on lexical retrieval.
     let vector_hits = vectors.search(query_vector, depth)?;
@@ -147,11 +153,7 @@ pub fn hybrid_search_ivf(
     options: HybridSearchOptions,
     probes: usize,
 ) -> Result<Vec<HybridHit>, IvfError> {
-    let depth = if options.limit == 0 {
-        0
-    } else {
-        options.candidate_depth
-    };
+    let depth = options.retrieval_depth();
     let vector_hits = vectors.search(query_vector, depth, probes)?;
     let bm25_hits = bm25.search(query, depth);
     Ok(reciprocal_rank_fusion(

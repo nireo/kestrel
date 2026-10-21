@@ -408,7 +408,7 @@ fn count_terms<'a>(
 
 fn scratch_hits(scratch: &mut Bm25Scratch) -> impl Iterator<Item = SearchHit> + '_ {
     scratch.touched.drain(..).map(|doc_id| {
-        let score = std::mem::replace(&mut scratch.scores[doc_id as usize], 0.0);
+        let score = std::mem::take(&mut scratch.scores[doc_id as usize]);
         SearchHit { doc_id, score }
     })
 }
@@ -431,14 +431,7 @@ fn top_k(hits: impl IntoIterator<Item = SearchHit>, limit: usize) -> Vec<SearchH
     }
     let hits = hits.into_iter();
     let mut best = BinaryHeap::with_capacity(limit.min(hits.size_hint().0));
-    for hit in hits {
-        let candidate = Reverse(RankedHit(hit));
-        if best.len() < limit {
-            best.push(candidate);
-        } else if candidate < *best.peek().expect("nonempty heap: limit is positive") {
-            *best.peek_mut().expect("nonempty heap: limit is positive") = candidate;
-        }
-    }
+    select_top_k(hits, limit, &mut best);
     best.into_sorted_vec()
         .into_iter()
         .map(|hit| hit.0.0)
@@ -453,8 +446,21 @@ fn top_k_into(
     heap: &mut BinaryHeap<Reverse<RankedHit>>,
     output: &mut Vec<SearchHit>,
 ) {
-    heap.clear();
     output.clear();
+    select_top_k(hits, limit, heap);
+    output.reserve(heap.len());
+    while let Some(hit) = heap.pop() {
+        output.push(hit.0.0);
+    }
+    output.reverse();
+}
+
+fn select_top_k(
+    hits: impl IntoIterator<Item = SearchHit>,
+    limit: usize,
+    heap: &mut BinaryHeap<Reverse<RankedHit>>,
+) {
+    heap.clear();
     if limit == 0 {
         return;
     }
@@ -468,11 +474,6 @@ fn top_k_into(
             *heap.peek_mut().expect("positive limit") = candidate;
         }
     }
-    output.reserve(heap.len());
-    while let Some(hit) = heap.pop() {
-        output.push(hit.0.0);
-    }
-    output.reverse();
 }
 
 /// Larger means better: higher score, then lower document ID.

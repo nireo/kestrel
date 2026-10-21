@@ -107,11 +107,7 @@ impl TextEmbedder {
     /// Add BGE's retrieval instruction and embed a single query. Pass the
     /// original query text, without the instruction, to BM25 and hybrid_search.
     pub fn embed_query(&mut self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
-        validate_texts(&[text])?;
-        let input = format!("{}{text}", CONFIG.query_instruction);
-        let mut vectors = self.model.embed([input], None)?;
-        validate_output(&vectors, 1)?;
-        Ok(vectors.remove(0))
+        Ok(self.embed_queries(&[text])?.remove(0))
     }
 
     /// Embed queries in bounded batches with BGE's retrieval instruction.
