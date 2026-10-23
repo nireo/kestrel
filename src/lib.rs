@@ -49,6 +49,13 @@ pub enum IndexError {
     DocumentTooLong,
 }
 
+/// Validated BM25 scoring parameters. Defaults to k1 = 1.2 and b = 0.75.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Bm25Params {
+    k1: f64,
+    b: f64,
+}
+
 /// An in-memory index with stable IDs and no updates or deletions.
 ///
 /// Text is lowercased, then split on non-alphanumeric characters. Indexing and
@@ -94,6 +101,7 @@ pub(crate) struct LexicalIndex {
     terms: HashMap<Box<str>, Vec<Posting>>,
     document_lengths: Vec<u32>,
     total_tokens: u64,
+    params: Bm25Params,
 }
 
 pub(crate) struct PreparedText<'a> {
@@ -106,9 +114,38 @@ enum PreparedFrequencies<'a> {
     Compact(Vec<(&'a str, u32)>),
 }
 
+impl Bm25Params {
+    /// Return `None` unless k1 is finite and positive and b is finite in [0, 1].
+    /// k1 controls term-frequency saturation; b controls length normalization.
+    pub fn new(k1: f64, b: f64) -> Option<Self> {
+        if !k1.is_finite() || k1 <= 0.0 || !b.is_finite() || !(0.0..=1.0).contains(&b) {
+            return None;
+        }
+
+        Some(Self { k1, b })
+    }
+}
+
+impl Default for Bm25Params {
+    fn default() -> Self {
+        Self { k1: 1.2, b: 0.75 }
+    }
+}
+
 impl InvertedIndex {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Create an empty index with custom BM25 scoring parameters.
+    pub fn with_bm25_params(params: Bm25Params) -> Self {
+        Self {
+            core: LexicalIndex {
+                params,
+                ..LexicalIndex::default()
+            },
+            documents: Vec::new(),
+        }
     }
 
     /// Append a document, assigning its position in the document store as its ID.
@@ -152,7 +189,7 @@ impl InvertedIndex {
         self.core.postings(term)
     }
 
-    /// Rank documents matching ANY query term using BM25 (k1 = 1.2, b = 0.75).
+    /// Rank documents matching ANY query term using the configured BM25 parameters.
     /// Repeated terms count once. Ties prefer lower IDs; scores are not probabilities.
     pub fn search(&self, query: &str, limit: usize) -> Vec<SearchHit> {
         self.core.search(query, limit)
@@ -256,7 +293,7 @@ impl LexicalIndex {
         self.terms.get(term).map_or(&[], Vec::as_slice)
     }
 
-    /// Rank documents matching ANY query term using BM25 (k1 = 1.2, b = 0.75).
+    /// Rank documents matching ANY query term using the configured BM25 parameters.
     ///
     /// Repeated query terms count once. Results have descending scores, with
     /// lower document IDs first on ties. Unknown terms contribute nothing.
@@ -346,11 +383,10 @@ impl LexicalIndex {
         seen: &mut Vec<Range<usize>>,
         mut add: impl FnMut(DocId, f64),
     ) {
-        const K1: f64 = 1.2;
-        const B: f64 = 0.75;
+        let Bm25Params { k1, b } = self.params;
         let document_count = self.len() as f64;
-        let length_scale = K1 * B / self.average_document_length();
-        let length_base = K1 * (1.0 - B);
+        let length_scale = k1 * b / self.average_document_length();
+        let length_base = k1 * (1.0 - b);
         let mut many_terms = None;
 
         for term in tokens(normalized) {
@@ -381,7 +417,7 @@ impl LexicalIndex {
             // Positive IDF variant: common terms still have nonnegative weight.
             let idf =
                 ((document_count - document_frequency + 0.5) / (document_frequency + 0.5)).ln_1p();
-            let weight = idf * (K1 + 1.0);
+            let weight = idf * (k1 + 1.0);
 
             for posting in postings {
                 let tf = f64::from(posting.term_frequency);

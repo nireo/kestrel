@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use kestrel::{InvertedIndex, Posting, SearchHit};
+use kestrel::{Bm25Params, InvertedIndex, Posting, SearchHit};
 
 fn index_documents(documents: &[&str]) -> InvertedIndex {
     let mut index = InvertedIndex::new();
@@ -78,6 +78,47 @@ fn score_matches_a_hand_calculated_bm25_example() {
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].doc_id, 0);
     assert!((hits[0].score - expected).abs() < 1e-12);
+}
+
+#[test]
+fn bm25_params_validate_ranges_and_non_finite_values() {
+    assert_eq!(Bm25Params::new(1.2, 0.75), Some(Bm25Params::default()));
+    for b in [0.0, 1.0] {
+        assert!(Bm25Params::new(1.2, b).is_some());
+    }
+    for k1 in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        assert!(Bm25Params::new(k1, 0.75).is_none());
+    }
+    for b in [-0.1, 1.1, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        assert!(Bm25Params::new(1.2, b).is_none());
+    }
+}
+
+#[test]
+fn custom_bm25_params_control_scoring_in_both_search_paths() {
+    let mut scratch = kestrel::Bm25Scratch::default();
+    for b in [0.0, 1.0] {
+        let mut index = InvertedIndex::with_bm25_params(Bm25Params::new(2.0, b).unwrap());
+        index.add_document("rust rust filler filler").unwrap();
+        index.add_document("rust rust").unwrap();
+
+        let hits = index.search("rust", 2);
+        assert_eq!(hits, index.search_with_scratch("rust", 2, &mut scratch));
+        // N=2, df=2, tf=2, average length=3, k1=2.
+        let idf = (1.0 + 0.5_f64 / 2.5).ln();
+        for hit in &hits {
+            let length = index.document_length(hit.doc_id).unwrap() as f64;
+            let expected = idf * 2.0 * 3.0 / (2.0 + 2.0 * (1.0 - b + b * length / 3.0));
+            assert!((hit.score - expected).abs() < 1e-12);
+        }
+        if b == 0.0 {
+            assert_eq!(hits[0].score, hits[1].score);
+            assert_eq!(hits[0].doc_id, 0);
+        } else {
+            assert_eq!(hits[0].doc_id, 1);
+            assert!(hits[0].score > hits[1].score);
+        }
+    }
 }
 
 #[test]
