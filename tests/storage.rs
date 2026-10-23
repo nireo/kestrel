@@ -1,6 +1,6 @@
 use kestrel::{
-    ChunkId, ChunkingConfig, CollectionError, EmbeddingConfig, HybridSearchOptions,
-    IvfBuildOptions, PersistentCollection, PreparedChunk, PreparedDocument, StorageError,
+    ChunkId, ChunkingConfig, CollectionError, EmbeddingConfig, IvfBuildOptions,
+    PersistentCollection, PreparedChunk, PreparedDocument, SearchOptions, StorageError,
     VectorSearchMode,
 };
 
@@ -15,6 +15,7 @@ const CONFIG: EmbeddingConfig = EmbeddingConfig {
 
 fn single(text: &str, embedding: [f32; 2]) -> PreparedDocument {
     PreparedDocument {
+        metadata: Default::default(),
         text: text.into(),
         chunks: vec![PreparedChunk {
             byte_range: 0..text.len(),
@@ -47,6 +48,7 @@ fn durable_batches_preserve_ids_passages_rankings_and_ivf_buffered_writes() {
         collection
             .add_documents(vec![
                 PreparedDocument {
+                    metadata: Default::default(),
                     text: "café rust engine".into(),
                     chunks: vec![
                         PreparedChunk {
@@ -68,7 +70,7 @@ fn durable_batches_preserve_ids_passages_rankings_and_ivf_buffered_writes() {
     assert!(std::fs::read(&path).unwrap().starts_with(&prefix));
     let expected = collection
         .retrieval()
-        .search_with_vector("engine", &[1.0, 0.0], HybridSearchOptions::default())
+        .search_with_vector("engine", &[1.0, 0.0], SearchOptions::default())
         .unwrap();
     collection.rebuild_vector_index().unwrap();
     assert_eq!(collection.retrieval().buffered_vector_count(), 0);
@@ -84,7 +86,7 @@ fn durable_batches_preserve_ids_passages_rankings_and_ivf_buffered_writes() {
     assert_eq!(core.chunk_text(ChunkId(2)), Some("rust engine"));
     assert_eq!(core.chunk(ChunkId(2)).unwrap().doc_id, 1);
     assert_eq!(
-        core.search_with_vector("engine", &[1.0, 0.0], HybridSearchOptions::default())
+        core.search_with_vector("engine", &[1.0, 0.0], SearchOptions::default())
             .unwrap(),
         expected
     );
@@ -220,7 +222,7 @@ fn local_preparation_batches_feed_durable_storage_without_mutating_the_preparer(
     let query = "I forgot my login credentials";
     let vector = local.embed_query(query)?;
     assert_eq!(local.add_documents(texts)?, [0, 1]);
-    let expected = local.search_with_vector(query, &vector, HybridSearchOptions::default())?;
+    let expected = local.search_with_vector(query, &vector, SearchOptions::default())?;
     assert!(local.add_documents(["valid", " "]).is_err());
     assert_eq!(local.len(), 2);
     drop(local);
@@ -229,7 +231,7 @@ fn local_preparation_batches_feed_durable_storage_without_mutating_the_preparer(
     assert_eq!(
         restored
             .retrieval()
-            .search_with_vector(query, &vector, HybridSearchOptions::default())?,
+            .search_with_vector(query, &vector, SearchOptions::default())?,
         expected
     );
     Ok(())

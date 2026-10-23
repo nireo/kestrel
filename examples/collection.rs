@@ -1,4 +1,4 @@
-use kestrel::{Collection, HybridSearchOptions};
+use kestrel::{Collection, SearchOptions};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut collection = Collection::new()?;
@@ -16,7 +16,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &query
     };
     println!("Query: {query}\n");
-    for hit in collection.search(query, HybridSearchOptions::default())? {
+    for hit in collection.search(query, SearchOptions::default())? {
         println!(
             "{:.6}  doc {}  chunk {}  BM25 rank {:?}  vector rank {:?}  {}",
             hit.score,

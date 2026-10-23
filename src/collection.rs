@@ -1,8 +1,8 @@
 use crate::chunking::Chunker;
 use crate::{
-    Chunk, ChunkHit, ChunkId, ChunkingConfig, ChunkingError, DocId, EmbeddingConfig,
-    EmbeddingError, HybridSearchOptions, IndexError, IvfError, PreparedChunk, PreparedDocument,
-    RetrievalCollection, StorageError, TextEmbedder, VectorError, VectorSearchMode,
+    Chunk, ChunkHit, ChunkId, ChunkingConfig, ChunkingError, DocId, Document, EmbeddingConfig,
+    EmbeddingError, IndexError, IvfError, Metadata, PreparedChunk, PreparedDocument,
+    RetrievalCollection, SearchOptions, StorageError, TextEmbedder, VectorError, VectorSearchMode,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -102,6 +102,10 @@ impl Collection {
         self.retrieval.document(doc_id)
     }
 
+    pub fn metadata(&self, doc_id: DocId) -> Option<&Metadata> {
+        self.retrieval.metadata(doc_id)
+    }
+
     pub fn chunk(&self, chunk_id: ChunkId) -> Option<&Chunk> {
         self.retrieval.chunk(chunk_id)
     }
@@ -157,40 +161,41 @@ impl Collection {
     /// passed to either `RetrievalCollection` or `PersistentCollection`.
     pub fn prepare_document(
         &mut self,
-        text: impl Into<String>,
+        document: impl Into<Document>,
     ) -> Result<PreparedDocument, CollectionError> {
-        Ok(self.prepare_documents([text])?.remove(0))
+        Ok(self.prepare_documents([document])?.remove(0))
     }
 
     /// Prepare a batch with embedding inference shared across documents. No
     /// collection data is changed, including when preparation fails.
     pub fn prepare_documents<I, S>(
         &mut self,
-        texts: I,
+        documents: I,
     ) -> Result<Vec<PreparedDocument>, CollectionError>
     where
         I: IntoIterator<Item = S>,
-        S: Into<String>,
+        S: Into<Document>,
     {
-        let texts: Vec<String> = texts.into_iter().map(Into::into).collect();
-        let mut ranges = Vec::with_capacity(texts.len());
-        for (index, text) in texts.iter().enumerate() {
-            if text.trim().is_empty() {
+        let documents: Vec<Document> = documents.into_iter().map(Into::into).collect();
+        let mut ranges = Vec::with_capacity(documents.len());
+        for (index, document) in documents.iter().enumerate() {
+            if document.text.trim().is_empty() {
                 return Err(EmbeddingError::EmptyText { index }.into());
             }
-            ranges.push(self.chunker.ranges(text)?);
+            ranges.push(self.chunker.ranges(&document.text)?);
         }
-        let passages: Vec<_> = texts
+        let passages: Vec<_> = documents
             .iter()
             .zip(&ranges)
-            .flat_map(|(text, ranges)| ranges.iter().map(|range| &text[range.clone()]))
+            .flat_map(|(document, ranges)| ranges.iter().map(|range| &document.text[range.clone()]))
             .collect();
         let mut embeddings = self.embedder.embed_documents(&passages)?.into_iter();
-        Ok(texts
+        Ok(documents
             .into_iter()
             .zip(ranges)
-            .map(|(text, ranges)| PreparedDocument {
-                text,
+            .map(|(document, ranges)| PreparedDocument {
+                text: document.text,
+                metadata: document.metadata,
                 chunks: ranges
                     .into_iter()
                     .map(|byte_range| PreparedChunk {
@@ -203,18 +208,21 @@ impl Collection {
     }
 
     /// Split and embed all passages before publishing the document.
-    pub fn add_document(&mut self, text: impl Into<String>) -> Result<DocId, CollectionError> {
-        let document = self.prepare_document(text)?;
+    pub fn add_document(
+        &mut self,
+        document: impl Into<Document>,
+    ) -> Result<DocId, CollectionError> {
+        let document = self.prepare_document(document)?;
         self.retrieval.add_document(document)
     }
 
     /// Batch local chunking and embedding, then atomically insert every document.
-    pub fn add_documents<I, S>(&mut self, texts: I) -> Result<Vec<DocId>, CollectionError>
+    pub fn add_documents<I, S>(&mut self, documents: I) -> Result<Vec<DocId>, CollectionError>
     where
         I: IntoIterator<Item = S>,
-        S: Into<String>,
+        S: Into<Document>,
     {
-        let documents = self.prepare_documents(texts)?;
+        let documents = self.prepare_documents(documents)?;
         self.retrieval.add_documents(documents)
     }
 
@@ -223,7 +231,7 @@ impl Collection {
     pub fn search(
         &mut self,
         query: &str,
-        options: HybridSearchOptions,
+        options: SearchOptions<'_>,
     ) -> Result<Vec<ChunkHit>, CollectionError> {
         let query_vector = self.embed_query(query)?;
         self.search_with_vector(query, &query_vector, options)
@@ -234,7 +242,7 @@ impl Collection {
     pub fn search_many(
         &mut self,
         queries: &[&str],
-        options: HybridSearchOptions,
+        options: SearchOptions<'_>,
     ) -> Result<Vec<Vec<ChunkHit>>, CollectionError> {
         let vectors = self.embed_queries(queries)?;
         let mut scratch = crate::SearchScratch::default();
@@ -253,7 +261,7 @@ impl Collection {
     pub fn search_many_with_workers(
         &mut self,
         queries: &[&str],
-        options: HybridSearchOptions,
+        options: SearchOptions<'_>,
         workers: std::num::NonZeroUsize,
     ) -> Result<Vec<Vec<ChunkHit>>, CollectionError> {
         if workers.get() == 1 {
@@ -276,7 +284,7 @@ impl Collection {
         &self,
         query: &str,
         query_vector: &[f32],
-        options: HybridSearchOptions,
+        options: SearchOptions<'_>,
     ) -> Result<Vec<ChunkHit>, CollectionError> {
         self.retrieval
             .search_with_vector(query, query_vector, options)

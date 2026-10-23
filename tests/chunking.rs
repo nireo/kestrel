@@ -1,6 +1,6 @@
 use kestrel::{
-    ChunkId, ChunkingConfig, Collection, CollectionError, EmbeddingError, HybridSearchOptions,
-    PersistentCollection, TextEmbedder,
+    ChunkId, ChunkingConfig, Collection, CollectionError, EmbeddingError, PersistentCollection,
+    SearchOptions, TextEmbedder,
 };
 
 #[test]
@@ -69,9 +69,10 @@ fn long_document_chunks_retrieve_the_tail_and_survive_durable_batch_recovery()
     );
 
     let query = "NEBULA-7429 telescope recovery code";
-    let options = HybridSearchOptions {
+    let options = SearchOptions {
         candidate_depth: collection.chunk_count(),
         limit: collection.chunk_count(),
+        filter: None,
     };
     let before = collection.search(query, options)?;
     assert_eq!(before[0].doc_id, doc_id);

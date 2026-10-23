@@ -1,4 +1,4 @@
-use kestrel::{ChunkingConfig, Collection, HybridSearchOptions};
+use kestrel::{ChunkingConfig, Collection, SearchOptions};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut collection = Collection::with_chunking(ChunkingConfig {
@@ -18,9 +18,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     for hit in collection.search(
         "NEBULA-7429 telescope recovery code",
-        HybridSearchOptions {
+        SearchOptions {
             candidate_depth: 10,
             limit: 3,
+            filter: None,
         },
     )? {
         let chunk = collection.chunk(hit.chunk_id).unwrap();

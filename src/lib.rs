@@ -8,6 +8,7 @@ mod collection;
 mod embeddings;
 mod hybrid;
 mod ivf;
+mod metadata;
 mod retrieval;
 mod storage;
 mod vector;
@@ -19,9 +20,10 @@ pub use hybrid::{
     HybridHit, HybridSearchOptions, hybrid_search, hybrid_search_ivf, reciprocal_rank_fusion,
 };
 pub use ivf::{IvfBuildOptions, IvfError, IvfIndex};
+pub use metadata::{Field, Filter, FiniteF64, Metadata, MetadataType, MetadataValue};
 pub use retrieval::{
-    Chunk, ChunkHit, ChunkId, PreparedChunk, PreparedDocument, RetrievalCollection,
-    VectorSearchMode,
+    Chunk, ChunkHit, ChunkId, Document, PreparedChunk, PreparedDocument, RetrievalCollection,
+    SearchOptions, VectorSearchMode,
 };
 pub use storage::{PersistentCollection, StorageError};
 pub use vector::{VectorError, VectorIndex};
@@ -78,12 +80,14 @@ pub struct Bm25Scratch {
     touched: Vec<DocId>,
 }
 
-/// Reusable workspace for one collection reader, including BM25, normalized
-/// query vectors, candidate lists, and top-k selection. Keep one per reader;
+/// Reusable workspace for one collection reader, including BM25, document
+/// eligibility, normalized query vectors, candidate lists, and top-k selection.
+/// Keep one per reader;
 /// collection searches stay read-only. Returned results remain independently owned.
 #[derive(Debug, Default)]
 pub struct SearchScratch {
     bm25: Bm25Scratch,
+    allowed_documents: Vec<bool>,
     query: Vec<f32>,
     bm25_hits: Vec<SearchHit>,
     vector_hits: Vec<SearchHit>,
@@ -310,9 +314,14 @@ impl LexicalIndex {
         };
         let mut seen = Vec::new();
         let mut scores = HashMap::<DocId, f64>::new();
-        self.accumulate(&normalized, &mut seen, |doc_id, contribution| {
-            *scores.entry(doc_id).or_default() += contribution;
-        });
+        self.accumulate(
+            &normalized,
+            &mut seen,
+            |_| true,
+            |doc_id, contribution| {
+                *scores.entry(doc_id).or_default() += contribution;
+            },
+        );
 
         top_k(
             scores
@@ -331,7 +340,7 @@ impl LexicalIndex {
         if limit == 0 || self.total_tokens == 0 {
             return Vec::new();
         }
-        self.score_with_scratch(query, scratch);
+        self.score_with_scratch(query, scratch, |_| true);
         top_k(scratch_hits(scratch), limit)
     }
 
@@ -342,16 +351,22 @@ impl LexicalIndex {
         scratch: &mut Bm25Scratch,
         heap: &mut BinaryHeap<Reverse<RankedHit>>,
         output: &mut Vec<SearchHit>,
+        allowed: impl Fn(DocId) -> bool,
     ) {
         output.clear();
         if limit == 0 || self.total_tokens == 0 {
             return;
         }
-        self.score_with_scratch(query, scratch);
+        self.score_with_scratch(query, scratch, allowed);
         top_k_into(scratch_hits(scratch), limit, heap, output);
     }
 
-    fn score_with_scratch(&self, query: &str, scratch: &mut Bm25Scratch) {
+    fn score_with_scratch(
+        &self,
+        query: &str,
+        scratch: &mut Bm25Scratch,
+        allowed: impl Fn(DocId) -> bool,
+    ) {
         scratch.seen.clear();
         scratch.normalized.clear();
         if query.is_ascii() {
@@ -367,6 +382,7 @@ impl LexicalIndex {
         self.accumulate(
             &scratch.normalized,
             &mut scratch.seen,
+            allowed,
             |id, contribution| {
                 let score = &mut scratch.scores[id as usize];
                 if *score == 0.0 {
@@ -381,6 +397,7 @@ impl LexicalIndex {
         &self,
         normalized: &str,
         seen: &mut Vec<Range<usize>>,
+        allowed: impl Fn(DocId) -> bool,
         mut add: impl FnMut(DocId, f64),
     ) {
         let Bm25Params { k1, b } = self.params;
@@ -420,6 +437,9 @@ impl LexicalIndex {
             let weight = idf * (k1 + 1.0);
 
             for posting in postings {
+                if !allowed(posting.doc_id) {
+                    continue;
+                }
                 let tf = f64::from(posting.term_frequency);
                 let length = f64::from(self.document_lengths[posting.doc_id as usize]);
                 let contribution = weight * tf / (tf + length_base + length_scale * length);

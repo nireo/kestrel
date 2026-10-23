@@ -1,7 +1,6 @@
 use kestrel::{
-    ChunkingConfig, Collection, CollectionError, EmbeddingConfig, EmbeddingError,
-    HybridSearchOptions, IvfBuildOptions, RetrievalCollection, TextEmbedder, VectorError,
-    VectorSearchMode,
+    ChunkingConfig, Collection, CollectionError, EmbeddingConfig, EmbeddingError, IvfBuildOptions,
+    RetrievalCollection, SearchOptions, TextEmbedder, VectorError, VectorSearchMode,
 };
 
 #[test]
@@ -15,7 +14,7 @@ fn collection_coordinates_real_embeddings_ids_search_and_failed_insertions()
     assert!(collection.document(0).is_none());
     assert!(
         collection
-            .search("password recovery", HybridSearchOptions::default())?
+            .search("password recovery", SearchOptions::default())?
             .is_empty()
     );
     assert!(matches!(
@@ -40,7 +39,7 @@ fn collection_coordinates_real_embeddings_ids_search_and_failed_insertions()
     assert!(collection.document(2).is_none());
 
     let query = "I forgot my login credentials";
-    let options = HybridSearchOptions::default();
+    let options = SearchOptions::default();
     let before = collection.search(query, options)?;
     assert_eq!(before.len(), 2);
     assert_eq!(before[0].doc_id, first);
@@ -81,13 +80,15 @@ fn collection_coordinates_real_embeddings_ids_search_and_failed_insertions()
         }))
     ));
     for options in [
-        HybridSearchOptions {
+        SearchOptions {
             candidate_depth: 0,
             limit: 3,
+            filter: None,
         },
-        HybridSearchOptions {
+        SearchOptions {
             candidate_depth: 3,
             limit: 0,
+            filter: None,
         },
     ] {
         assert!(collection.search(query, options)?.is_empty());
@@ -121,7 +122,7 @@ fn ivf_collection_supports_buffered_writes_shared_readers_and_model_detachment()
     assert_eq!(collection.buffered_vector_count(), 1);
     let query = "How do I log into my account?";
     let vector = collection.embed_query(query)?;
-    let options = HybridSearchOptions::default();
+    let options = SearchOptions::default();
     let expected = collection.search_with_vector(query, &vector, options)?;
     assert!(
         expected
@@ -156,7 +157,7 @@ fn ivf_collection_supports_buffered_writes_shared_readers_and_model_detachment()
         collection.search_with_vector(
             query,
             &zero,
-            HybridSearchOptions {
+            SearchOptions {
                 limit: 0,
                 ..options
             }

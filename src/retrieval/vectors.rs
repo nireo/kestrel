@@ -1,7 +1,5 @@
-use crate::vector::{normalize, normalize_in_place, normalize_into, validate_normalized};
-use crate::{
-    DocId, IvfBuildOptions, IvfError, IvfIndex, SearchHit, VectorError, VectorIndex, top_k,
-};
+use crate::vector::{normalize_in_place, normalize_into, validate_normalized};
+use crate::{DocId, IvfBuildOptions, IvfError, IvfIndex, VectorError, VectorIndex};
 
 /// Collection vector retrieval. Changing only probes does not retrain IVF.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -45,10 +43,6 @@ impl CollectionVectors {
         }
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
     pub(crate) fn mode(&self) -> VectorSearchMode {
         match self {
             Self::Exact(_) => VectorSearchMode::Exact,
@@ -73,10 +67,6 @@ impl CollectionVectors {
         }
     }
 
-    pub(crate) fn normalize(&self, vector: &[f32]) -> Result<Vec<f32>, VectorError> {
-        normalize(vector, self.dimensions())
-    }
-
     pub(crate) fn normalize_in_place(&self, vector: &mut [f32]) -> Result<(), VectorError> {
         normalize_in_place(vector, self.dimensions())
     }
@@ -98,39 +88,6 @@ impl CollectionVectors {
             Self::Exact(index) => index.reserve(additional),
             Self::Ivf { buffer, .. } => buffer.reserve(additional),
         }
-    }
-
-    pub(crate) fn search(
-        &self,
-        query: &[f32],
-        limit: usize,
-    ) -> Result<Vec<SearchHit>, VectorError> {
-        // Normalize once, then use exactly the same query for base and buffer.
-        let query = self.normalize(query)?;
-        if limit == 0 || self.is_empty() {
-            return Ok(Vec::new());
-        }
-        Ok(match self {
-            Self::Exact(index) => index.search_normalized(&query, limit),
-            Self::Ivf {
-                index,
-                buffer,
-                probes,
-                ..
-            } => {
-                if index.is_empty() {
-                    return Ok(buffer.search_normalized(&query, limit));
-                }
-                let base_hits = index.search_normalized(&query, limit, *probes);
-                if buffer.is_empty() {
-                    return Ok(base_hits);
-                }
-                let buffer_hits = buffer.search_normalized(&query, limit);
-                // Merge by cosine score into ONE vector ranking before RRF.
-                // Top-k from each disjoint store is sufficient for global top-k.
-                top_k(base_hits.into_iter().chain(buffer_hits), limit)
-            }
-        })
     }
 
     pub(crate) fn search_into(

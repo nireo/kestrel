@@ -12,6 +12,7 @@ const CONFIG: EmbeddingConfig = EmbeddingConfig {
 
 fn document(text: &str, embedding: [f32; 2]) -> PreparedDocument {
     PreparedDocument {
+        metadata: Default::default(),
         text: text.into(),
         chunks: vec![PreparedChunk {
             byte_range: 0..text.len(),

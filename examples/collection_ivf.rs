@@ -1,4 +1,4 @@
-use kestrel::{Collection, HybridSearchOptions, IvfBuildOptions, VectorSearchMode};
+use kestrel::{Collection, IvfBuildOptions, SearchOptions, VectorSearchMode};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut collection = Collection::new()?;
@@ -20,9 +20,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let query = "How are new passages searchable before rebuilding?";
     let query_vector = collection.embed_query(query)?;
     // Retrieval only borrows &self; prepared vectors can be searched concurrently.
-    for hit in
-        collection.search_with_vector(query, &query_vector, HybridSearchOptions::default())?
-    {
+    for hit in collection.search_with_vector(query, &query_vector, SearchOptions::default())? {
         println!(
             "doc {} chunk {}: {}",
             hit.doc_id,

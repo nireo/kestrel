@@ -1,8 +1,8 @@
 //! Compare length-grouped batches with the original input-order batches.
 //! Loads the real model. Run in release mode after caching model artifacts.
 use kestrel::{
-    ChunkingConfig, EmbeddingConfig, HybridSearchOptions, PreparedChunk, PreparedDocument,
-    RetrievalCollection, TextEmbedder,
+    ChunkingConfig, EmbeddingConfig, PreparedChunk, PreparedDocument, RetrievalCollection,
+    SearchOptions, TextEmbedder,
 };
 use serde_json::json;
 use std::{hint::black_box, time::Instant};
@@ -42,6 +42,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|row| {
             let text = format!("search record{row}");
             PreparedDocument {
+                metadata: Default::default(),
                 chunks: vec![PreparedChunk {
                     byte_range: 0..text.len(),
                     embedding: (0..384)
@@ -108,7 +109,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .collect();
                 let results = index.search_many_with_vectors(
                     &inputs,
-                    HybridSearchOptions::default(),
+                    SearchOptions::default(),
                     std::num::NonZeroUsize::new(workers).unwrap(),
                 )?;
                 let elapsed = start.elapsed().as_secs_f64() * 1000.0;

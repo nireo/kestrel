@@ -15,7 +15,7 @@ use crate::{
 };
 
 const MAGIC: &[u8; 8] = b"KSTRLOG\0";
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 /// Split larger transactions into smaller batches. Recovery buffers one encoded
 /// transaction at a time, rather than holding the complete file in memory.

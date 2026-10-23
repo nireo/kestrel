@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use kestrel::{Collection, EmbeddingConfig, HybridSearchOptions, PersistentCollection};
+use kestrel::{Collection, EmbeddingConfig, PersistentCollection, SearchOptions};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = PathBuf::from(
@@ -28,7 +28,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let query = "I forgot my login credentials";
     let vector = local.embed_query(query)?;
     let retrieval = stored.retrieval();
-    for hit in retrieval.search_with_vector(query, &vector, HybridSearchOptions::default())? {
+    for hit in retrieval.search_with_vector(query, &vector, SearchOptions::default())? {
         println!(
             "{:.6}  doc {}  chunk {}  {}",
             hit.score,

@@ -7,7 +7,7 @@ use std::ops::Range;
 
 use kestrel::{
     ChunkId, ChunkingConfig, ChunkingError, CollectionError, EmbeddingConfig, EmbeddingError,
-    HybridSearchOptions, IvfBuildOptions, PreparedChunk, PreparedDocument, RetrievalCollection,
+    IvfBuildOptions, PreparedChunk, PreparedDocument, RetrievalCollection, SearchOptions,
     VectorError, VectorSearchMode,
 };
 
@@ -27,6 +27,7 @@ fn collection() -> RetrievalCollection {
 fn prepared(text: &str, ranges: Vec<Range<usize>>, vectors: Vec<Vec<f32>>) -> PreparedDocument {
     assert_eq!(ranges.len(), vectors.len());
     PreparedDocument {
+        metadata: Default::default(),
         text: text.into(),
         chunks: ranges
             .into_iter()
@@ -80,7 +81,7 @@ fn external_embeddings_rank_passages_and_preserve_source_text() {
     assert!(core.chunk(ChunkId(3)).is_none());
     assert!(core.chunk_text(ChunkId(3)).is_none());
     let hits = core
-        .search_with_vector("engine", &[0.0, 2.0], HybridSearchOptions::default())
+        .search_with_vector("engine", &[0.0, 2.0], SearchOptions::default())
         .unwrap();
     assert_eq!(hits[0].chunk_id, ChunkId(1));
     assert_eq!(hits[0].doc_id, 0);
@@ -92,45 +93,41 @@ fn external_embeddings_rank_passages_and_preserve_source_text() {
 #[test]
 fn reusable_search_matches_exact_and_ivf_after_errors_and_buffered_writes() {
     let mut core = collection();
-    let mut scratch = kestrel::Bm25Scratch::default();
+    let mut scratch = kestrel::SearchScratch::default();
     core.add_document(single("rust engine", [1.0, 0.0]))
         .unwrap();
     for mode in [VectorSearchMode::Exact, ivf_mode()] {
         core.set_vector_search_mode(mode).unwrap();
         core.add_document(single("fresh rust", [0.0, 1.0])).unwrap();
         for limit in [0, 1, 10] {
-            let options = HybridSearchOptions {
+            let options = SearchOptions {
                 limit,
                 candidate_depth: 10,
+                filter: None,
             };
             for query in ["RUST rust", "fresh", "missing"] {
                 assert_eq!(
                     core.search_with_vector(query, &[1.0, 0.0], options)
                         .unwrap(),
-                    core.search_with_vector_and_scratch(query, &[1.0, 0.0], options, &mut scratch)
+                    core.search_with_scratch(query, &[1.0, 0.0], options, &mut scratch)
                         .unwrap()
                 );
                 assert!(
-                    core.search_with_vector_and_scratch(query, &[0.0, 0.0], options, &mut scratch)
+                    core.search_with_scratch(query, &[0.0, 0.0], options, &mut scratch)
                         .is_err()
                 );
             }
             assert!(
-                core.search_with_vector_and_scratch(" ", &[1.0, 0.0], options, &mut scratch)
+                core.search_with_scratch(" ", &[1.0, 0.0], options, &mut scratch)
                     .is_err()
             );
         }
         core.rebuild_vector_index().unwrap();
         assert_eq!(
-            core.search_with_vector("fresh", &[0.0, 1.0], HybridSearchOptions::default())
+            core.search_with_vector("fresh", &[0.0, 1.0], SearchOptions::default())
                 .unwrap(),
-            core.search_with_vector_and_scratch(
-                "fresh",
-                &[0.0, 1.0],
-                HybridSearchOptions::default(),
-                &mut scratch
-            )
-            .unwrap()
+            core.search_with_scratch("fresh", &[0.0, 1.0], SearchOptions::default(), &mut scratch)
+                .unwrap()
         );
     }
 }
@@ -143,7 +140,7 @@ fn malformed_prepared_documents_leave_exact_and_ivf_indexes_unchanged() {
         core.set_vector_search_mode(mode).unwrap();
         core.add_document(single("fresh", [0.0, 1.0])).unwrap();
         let before = core
-            .search_with_vector("base", &[1.0, 0.0], HybridSearchOptions::default())
+            .search_with_vector("base", &[1.0, 0.0], SearchOptions::default())
             .unwrap();
         let buffered = core.buffered_vector_count();
         for (text, ranges) in [
@@ -185,7 +182,7 @@ fn malformed_prepared_documents_leave_exact_and_ivf_indexes_unchanged() {
         assert_eq!(core.chunk_count(), 2);
         assert_eq!(core.buffered_vector_count(), buffered);
         assert_eq!(
-            core.search_with_vector("base", &[1.0, 0.0], HybridSearchOptions::default())
+            core.search_with_vector("base", &[1.0, 0.0], SearchOptions::default())
                 .unwrap(),
             before
         );
@@ -198,7 +195,7 @@ fn a_bad_later_document_rejects_the_whole_batch_and_preserves_ids() {
     let mut core = collection();
     core.add_document(single("base", [1.0, 0.0])).unwrap();
     let before = core
-        .search_with_vector("base", &[1.0, 0.0], HybridSearchOptions::default())
+        .search_with_vector("base", &[1.0, 0.0], SearchOptions::default())
         .unwrap();
     assert!(
         core.add_documents(vec![
@@ -210,7 +207,7 @@ fn a_bad_later_document_rejects_the_whole_batch_and_preserves_ids() {
     assert_eq!(core.len(), 1);
     assert_eq!(core.chunk_count(), 1);
     assert_eq!(
-        core.search_with_vector("base", &[1.0, 0.0], HybridSearchOptions::default())
+        core.search_with_vector("base", &[1.0, 0.0], SearchOptions::default())
             .unwrap(),
         before
     );
@@ -251,9 +248,9 @@ fn validates_configuration_and_queries_even_for_empty_indexes_or_zero_limits() {
     ));
     let core = collection();
     for limit in [0, 10] {
-        let options = HybridSearchOptions {
+        let options = SearchOptions {
             limit,
-            ..HybridSearchOptions::default()
+            ..SearchOptions::default()
         };
         assert!(matches!(
             core.search_with_vector(" \n", &[1.0, 0.0], options),
@@ -276,7 +273,7 @@ fn retrieval_supports_concurrent_readers() {
     core.add_document(single("rust", [1.0, 0.0])).unwrap();
     core.set_vector_search_mode(ivf_mode()).unwrap();
     core.add_document(single("engine", [0.0, 1.0])).unwrap();
-    let options = HybridSearchOptions::default();
+    let options = SearchOptions::default();
     let expected = core
         .search_with_vector("rust", &[1.0, 0.0], options)
         .unwrap();
@@ -298,7 +295,7 @@ fn retrieval_supports_concurrent_readers() {
 #[test]
 fn full_workspace_preserves_rankings_across_modes_limits_errors_and_readers() {
     let mut scratch = kestrel::SearchScratch::default();
-    let options = HybridSearchOptions::default();
+    let options = SearchOptions::default();
     for mode in [
         VectorSearchMode::Exact,
         ivf_mode(),
@@ -323,9 +320,10 @@ fn full_workspace_preserves_rankings_across_modes_limits_errors_and_readers() {
             .search_with_scratch("rust", &[1.0, 0.0], options, &mut scratch)
             .unwrap();
         for (depth, limit) in [(50, 10), (0, 10), (50, 0), (1, 1), (usize::MAX, usize::MAX)] {
-            let options = HybridSearchOptions {
+            let options = SearchOptions {
                 candidate_depth: depth,
                 limit,
+                filter: None,
             };
             for q in ["RUST rust", "CAFÉ", "missing", "search"] {
                 let expected = core.search_with_vector(q, &[1.0, 0.0], options).unwrap();
@@ -412,7 +410,7 @@ fn reusable_results_and_parallel_batches_preserve_rankings_and_validation() {
     for mode in [VectorSearchMode::Exact, ivf_mode()] {
         core.set_vector_search_mode(mode).unwrap();
         for limit in [0, 1, 10] {
-            let options = HybridSearchOptions {
+            let options = SearchOptions {
                 limit,
                 ..Default::default()
             };
@@ -447,7 +445,7 @@ fn reusable_results_and_parallel_batches_preserve_rankings_and_validation() {
             }
         }
     }
-    let options = HybridSearchOptions::default();
+    let options = SearchOptions::default();
     core.search_into("rust", &[1.0, 0.0], options, &mut scratch, &mut output)
         .unwrap();
     assert!(!output.is_empty());

@@ -6,8 +6,8 @@ use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use kestrel::{
-    ChunkingConfig, EmbeddingConfig, HybridSearchOptions, IvfBuildOptions, IvfIndex,
-    PersistentCollection, PreparedChunk, PreparedDocument, RetrievalCollection, SearchScratch,
+    ChunkingConfig, EmbeddingConfig, IvfBuildOptions, IvfIndex, PersistentCollection,
+    PreparedChunk, PreparedDocument, RetrievalCollection, SearchOptions, SearchScratch,
     VectorIndex, VectorSearchMode,
 };
 use serde_json::json;
@@ -118,6 +118,7 @@ fn passage_batches(rows: usize, batch_size: usize, distinct: usize) -> Vec<Vec<P
                     }
                     let len = text.len();
                     PreparedDocument {
+                        metadata: Default::default(),
                         text,
                         chunks: vec![PreparedChunk {
                             byte_range: 0..len,
@@ -246,7 +247,7 @@ fn main() -> Result<(), Error> {
                 _ => "missing".into(),
             })
             .collect();
-        let options = HybridSearchOptions::default();
+        let options = SearchOptions::default();
         for (name, mode) in [
             ("query_exact_64", VectorSearchMode::Exact),
             (
@@ -306,7 +307,7 @@ fn main() -> Result<(), Error> {
             .zip(&vectors)
             .map(|(q, v)| (q.as_str(), v.as_slice()))
             .collect();
-        let options = HybridSearchOptions::default();
+        let options = SearchOptions::default();
         for (mode_name, mode) in [
             ("exact", VectorSearchMode::Exact),
             (

@@ -2,8 +2,8 @@
 //! The two-dimensional vectors are hand-written for demonstration only.
 
 use kestrel::{
-    ChunkingConfig, EmbeddingConfig, HybridSearchOptions, PersistentCollection, PreparedChunk,
-    PreparedDocument,
+    ChunkingConfig, EmbeddingConfig, PersistentCollection, PreparedChunk, PreparedDocument,
+    SearchOptions,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -27,6 +27,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
     ] {
         documents.push(PreparedDocument {
+            metadata: Default::default(),
             text: text.into(),
             chunks: vec![PreparedChunk {
                 byte_range: 0..text.len(),
@@ -43,7 +44,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let hits = restored.retrieval().search_with_vector(
         "keyword search",
         &[1.0, 0.0],
-        HybridSearchOptions::default(),
+        SearchOptions::default(),
     )?;
     for hit in hits {
         println!(

@@ -3,9 +3,8 @@ use std::ops::Range;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Bm25Scratch, ChunkingConfig, CollectionError, DocId, EmbeddingConfig, EmbeddingError,
-    HybridHit, HybridSearchOptions, IndexError, LexicalIndex, SearchScratch, VectorError,
-    reciprocal_rank_fusion,
+    ChunkingConfig, CollectionError, DocId, EmbeddingConfig, EmbeddingError, Filter, HybridHit,
+    IndexError, LexicalIndex, Metadata, SearchScratch, VectorError,
 };
 
 mod vectors;
@@ -32,10 +31,81 @@ pub struct ChunkHit {
     pub vector_rank: Option<usize>,
 }
 
-/// Original text is owned once; chunks reference byte ranges in that text.
+/// Collection search settings. Filtering restricts candidates before ranking.
+#[derive(Debug, Clone, Copy)]
+pub struct SearchOptions<'a> {
+    /// Maximum eligible candidates retrieved from EACH index before fusion.
+    pub candidate_depth: usize,
+    /// Maximum fused results returned, independent of candidate_depth.
+    pub limit: usize,
+    /// Document-level predicate. Filtered vector searches use exact scoring,
+    /// including when the collection has an IVF index and insertion buffer.
+    pub filter: Option<&'a Filter<'a>>,
+}
+
+impl Default for SearchOptions<'_> {
+    fn default() -> Self {
+        Self {
+            candidate_depth: 50,
+            limit: 10,
+            filter: None,
+        }
+    }
+}
+
+impl SearchOptions<'_> {
+    fn retrieval_depth(self) -> usize {
+        if self.limit == 0 {
+            0
+        } else {
+            self.candidate_depth
+        }
+    }
+}
+
+/// Source text and metadata, shared by all of a document's passages.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Document {
+    pub text: String,
+    pub metadata: Metadata,
+}
+
+impl Document {
+    pub fn new(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            metadata: Metadata::default(),
+        }
+    }
+
+    pub fn with_metadata(mut self, metadata: Metadata) -> Self {
+        self.metadata = metadata;
+        self
+    }
+}
+
+impl From<String> for Document {
+    fn from(text: String) -> Self {
+        Self::new(text)
+    }
+}
+
+impl From<&str> for Document {
+    fn from(text: &str) -> Self {
+        Self::new(text)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct StoredDocument {
+    source: Document,
+    chunk_range: Range<usize>,
+}
+
+/// Original text and metadata are owned once; chunks reference their source.
 #[derive(Debug)]
 pub(crate) struct CollectionData {
-    pub(crate) documents: Vec<String>,
+    pub(crate) documents: Vec<StoredDocument>,
     pub(crate) chunks: Vec<Chunk>,
     pub(crate) bm25: LexicalIndex,
     pub(crate) vectors: CollectionVectors,
@@ -118,6 +188,7 @@ impl CollectionData {
         let mut lexical = lexical.into_iter();
         for document in documents {
             let doc_id = self.documents.len() as DocId;
+            let chunk_start = self.chunks.len();
             for chunk in document.chunks {
                 let chunk_id = self
                     .bm25
@@ -128,7 +199,13 @@ impl CollectionData {
                     byte_range: chunk.byte_range,
                 });
             }
-            self.documents.push(document.text);
+            self.documents.push(StoredDocument {
+                source: Document {
+                    text: document.text,
+                    metadata: document.metadata,
+                },
+                chunk_range: chunk_start..self.chunks.len(),
+            });
         }
         Ok(start..end)
     }
@@ -137,37 +214,16 @@ impl CollectionData {
         &self,
         query: &str,
         query_vector: &[f32],
-        options: HybridSearchOptions,
+        options: SearchOptions<'_>,
     ) -> Result<Vec<ChunkHit>, VectorError> {
-        self.search_with_scratch(query, query_vector, options, None)
-    }
-
-    fn search_with_scratch(
-        &self,
-        query: &str,
-        query_vector: &[f32],
-        options: HybridSearchOptions,
-        scratch: Option<&mut Bm25Scratch>,
-    ) -> Result<Vec<ChunkHit>, VectorError> {
-        let depth = options.retrieval_depth();
-        let vector_hits = self.vectors.search(query_vector, depth)?;
-        let bm25_hits = match scratch {
-            Some(scratch) => self.bm25.search_with_scratch(query, depth, scratch),
-            None => self.bm25.search(query, depth),
-        };
-        Ok(
-            reciprocal_rank_fusion(&bm25_hits, &vector_hits, options.limit)
-                .into_iter()
-                .map(|hit| self.chunk_hit(hit))
-                .collect(),
-        )
+        self.search_with_workspace(query, query_vector, options, &mut SearchScratch::default())
     }
 
     fn search_with_workspace(
         &self,
         query: &str,
         vector: &[f32],
-        options: HybridSearchOptions,
+        options: SearchOptions<'_>,
         scratch: &mut SearchScratch,
     ) -> Result<Vec<ChunkHit>, VectorError> {
         let mut output = Vec::new();
@@ -179,20 +235,70 @@ impl CollectionData {
         &self,
         query: &str,
         vector: &[f32],
-        options: HybridSearchOptions,
+        options: SearchOptions<'_>,
         scratch: &mut SearchScratch,
         output: &mut Vec<ChunkHit>,
     ) -> Result<(), VectorError> {
         output.clear();
         let depth = options.retrieval_depth();
-        self.vectors.search_into(vector, depth, scratch)?;
-        self.bm25.search_into(
-            query,
-            depth,
-            &mut scratch.bm25,
-            &mut scratch.heap,
-            &mut scratch.bm25_hits,
-        );
+        if let Some(filter) = options.filter {
+            // Validate even when no documents match or no results are requested.
+            crate::vector::normalize_into(vector, self.vectors.dimensions(), &mut scratch.query)?;
+            if depth == 0 {
+                return Ok(());
+            }
+            scratch.allowed_documents.clear();
+            let mut any_allowed = false;
+            for document in &self.documents {
+                let allowed = filter.matches(&document.source.metadata);
+                scratch.allowed_documents.push(allowed);
+                any_allowed |= allowed;
+            }
+            if !any_allowed {
+                return Ok(());
+            }
+            // Visit only eligible vectors. Each document's chunks are contiguous;
+            // no chunk mask, candidate-ID allocation, or rejected dot products.
+            let chunks = self
+                .documents
+                .iter()
+                .zip(&scratch.allowed_documents)
+                .filter(|(_, allowed)| **allowed)
+                .flat_map(|(document, _)| document.chunk_range.clone());
+            crate::top_k_into(
+                chunks.map(|row| {
+                    let doc_id = row as DocId;
+                    let vector = self.vectors.vector(doc_id).expect("chunk has a vector");
+                    crate::SearchHit {
+                        doc_id,
+                        score: crate::vector::dot(vector, &scratch.query).clamp(-1.0, 1.0),
+                    }
+                }),
+                depth,
+                &mut scratch.heap,
+                &mut scratch.vector_hits,
+            );
+            self.bm25.search_into(
+                query,
+                depth,
+                &mut scratch.bm25,
+                &mut scratch.heap,
+                &mut scratch.bm25_hits,
+                |chunk_id| {
+                    scratch.allowed_documents[self.chunks[chunk_id as usize].doc_id as usize]
+                },
+            );
+        } else {
+            self.vectors.search_into(vector, depth, scratch)?;
+            self.bm25.search_into(
+                query,
+                depth,
+                &mut scratch.bm25,
+                &mut scratch.heap,
+                &mut scratch.bm25_hits,
+                |_| true,
+            );
+        }
         crate::hybrid::collect_candidates(
             &scratch.bm25_hits,
             &scratch.vector_hits,
@@ -245,9 +351,17 @@ pub struct PreparedChunk {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PreparedDocument {
     pub text: String,
+    pub metadata: Metadata,
     /// Nonblank passages in strictly advancing byte-range order. Adjacent
     /// passages may overlap but must cover the entire document without gaps.
     pub chunks: Vec<PreparedChunk>,
+}
+
+impl PreparedDocument {
+    pub fn with_metadata(mut self, metadata: Metadata) -> Self {
+        self.metadata = metadata;
+        self
+    }
 }
 
 /// Model-free, append-only passage retrieval. Owns source text, BM25, vectors,
@@ -307,30 +421,12 @@ impl RetrievalCollection {
         &self,
         query: &str,
         query_vector: &[f32],
-        options: HybridSearchOptions,
+        options: SearchOptions<'_>,
     ) -> Result<Vec<ChunkHit>, CollectionError> {
         if query.trim().is_empty() {
             return Err(EmbeddingError::EmptyText { index: 0 }.into());
         }
         Ok(self.data.search(query, query_vector, options)?)
-    }
-
-    /// Read-only retrieval with reusable BM25 score storage. Keep one workspace
-    /// per reader to avoid per-match hashing without serializing shared reads.
-    /// Validation and ranking match `search_with_vector`.
-    pub fn search_with_vector_and_scratch(
-        &self,
-        query: &str,
-        query_vector: &[f32],
-        options: HybridSearchOptions,
-        scratch: &mut Bm25Scratch,
-    ) -> Result<Vec<ChunkHit>, CollectionError> {
-        if query.trim().is_empty() {
-            return Err(EmbeddingError::EmptyText { index: 0 }.into());
-        }
-        Ok(self
-            .data
-            .search_with_scratch(query, query_vector, options, Some(scratch))?)
     }
 
     /// Read-only retrieval reusing normalization, candidate, and selection
@@ -339,7 +435,7 @@ impl RetrievalCollection {
         &self,
         query: &str,
         query_vector: &[f32],
-        options: HybridSearchOptions,
+        options: SearchOptions<'_>,
         scratch: &mut SearchScratch,
     ) -> Result<Vec<ChunkHit>, CollectionError> {
         if query.trim().is_empty() {
@@ -356,7 +452,7 @@ impl RetrievalCollection {
         &self,
         query: &str,
         query_vector: &[f32],
-        options: HybridSearchOptions,
+        options: SearchOptions<'_>,
         scratch: &mut SearchScratch,
         output: &mut Vec<ChunkHit>,
     ) -> Result<(), CollectionError> {
@@ -375,7 +471,7 @@ impl RetrievalCollection {
     pub fn search_many_with_vectors(
         &self,
         queries: &[(&str, &[f32])],
-        options: HybridSearchOptions,
+        options: SearchOptions<'_>,
         workers: std::num::NonZeroUsize,
     ) -> Result<Vec<Vec<ChunkHit>>, CollectionError> {
         if queries.is_empty() {
@@ -433,7 +529,18 @@ impl RetrievalCollection {
     }
 
     pub fn document(&self, doc_id: DocId) -> Option<&str> {
-        self.data.documents.get(doc_id as usize).map(String::as_str)
+        self.data
+            .documents
+            .get(doc_id as usize)
+            .map(|document| document.source.text.as_str())
+    }
+
+    /// Borrow the source metadata shared by all passages in this document.
+    pub fn metadata(&self, doc_id: DocId) -> Option<&Metadata> {
+        self.data
+            .documents
+            .get(doc_id as usize)
+            .map(|document| &document.source.metadata)
     }
 
     pub fn chunk(&self, chunk_id: ChunkId) -> Option<&Chunk> {

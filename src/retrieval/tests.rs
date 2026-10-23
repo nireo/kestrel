@@ -14,6 +14,7 @@ fn index_document(
 ) -> Result<DocId, CollectionError> {
     assert_eq!(ranges.len(), embeddings.len());
     let document = PreparedDocument {
+        metadata: Default::default(),
         text,
         chunks: ranges
             .into_iter()
@@ -25,6 +26,16 @@ fn index_document(
             .collect(),
     };
     Ok(data.insert_batch([document], true, |_| Ok(()))?.start as DocId)
+}
+
+fn vector_hits(
+    data: &CollectionData,
+    query: &[f32],
+    limit: usize,
+) -> Result<Vec<crate::SearchHit>, VectorError> {
+    let mut scratch = SearchScratch::default();
+    data.vectors.search_into(query, limit, &mut scratch)?;
+    Ok(scratch.vector_hits)
 }
 
 fn ivf_mode(probes: usize) -> VectorSearchMode {
@@ -67,12 +78,12 @@ fn chunks_share_parent_ids_but_have_distinct_index_rows() {
     assert_eq!(data.vectors.vector(0), Some(&[0.6, 0.8][..]));
     assert_eq!(data.bm25.search("engine", 1)[0].doc_id, 1);
     let hits = data
-        .search("engine", &[0.0, 1.0], HybridSearchOptions::default())
+        .search("engine", &[0.0, 1.0], SearchOptions::default())
         .unwrap();
     assert_eq!(hits[0].chunk_id, ChunkId(1));
     assert_eq!(hits[0].doc_id, first);
     assert_eq!(
-        &data.documents[0][data.chunks[1].byte_range.clone()],
+        &data.documents[0].source.text[data.chunks[1].byte_range.clone()],
         "engine"
     );
     assert_eq!(hits.iter().filter(|hit| hit.doc_id == first).count(), 2);
@@ -83,7 +94,7 @@ fn invalid_later_chunk_does_not_publish_earlier_chunks_or_consume_ids() {
     let mut data = CollectionData::new(2).unwrap();
     index_document(&mut data, "rust".into(), vec![0..4], vec![vec![1.0, 0.0]]).unwrap();
     let before = data
-        .search("rust", &[1.0, 0.0], HybridSearchOptions::default())
+        .search("rust", &[1.0, 0.0], SearchOptions::default())
         .unwrap();
     for invalid in [
         vec![1.0],
@@ -98,13 +109,19 @@ fn invalid_later_chunk_does_not_publish_earlier_chunks_or_consume_ids() {
             vec![vec![0.0, 1.0], invalid],
         );
         assert!(matches!(result, Err(CollectionError::Vector(_))));
-        assert_eq!(data.documents, ["rust"]);
+        assert_eq!(
+            data.documents
+                .iter()
+                .map(|document| document.source.text.as_str())
+                .collect::<Vec<_>>(),
+            ["rust"]
+        );
         assert_eq!(data.chunks.len(), 1);
         assert_eq!(data.bm25.len(), 1);
         assert_eq!(data.vectors.len(), 1);
         assert!(data.bm25.postings("engine").is_empty());
         assert_eq!(
-            data.search("rust", &[1.0, 0.0], HybridSearchOptions::default())
+            data.search("rust", &[1.0, 0.0], SearchOptions::default())
                 .unwrap(),
             before
         );
@@ -143,9 +160,10 @@ fn ivf_buffer_is_immediately_searchable_and_vector_ranks_are_merged_before_fusio
         .search(
             "absent",
             &[1.0, 0.0],
-            HybridSearchOptions {
+            SearchOptions {
                 candidate_depth: 1,
                 limit: 1,
+                filter: None,
             },
         )
         .unwrap();
@@ -156,9 +174,10 @@ fn ivf_buffer_is_immediately_searchable_and_vector_ranks_are_merged_before_fusio
         .search(
             "absent",
             &[1.0, 0.0],
-            HybridSearchOptions {
+            SearchOptions {
                 candidate_depth: 3,
                 limit: 3,
+                filter: None,
             },
         )
         .unwrap();
@@ -175,9 +194,10 @@ fn ivf_buffer_is_immediately_searchable_and_vector_ranks_are_merged_before_fusio
     for query in ["shared", "base", "fresh", "absent", ""] {
         for candidate_depth in [0, 1, 2, 5, usize::MAX] {
             for limit in [0, 1, 3, 20] {
-                let options = HybridSearchOptions {
+                let options = SearchOptions {
                     candidate_depth,
                     limit,
+                    filter: None,
                 };
                 assert_eq!(
                     data.search(query, &[1.0, 0.0], options).unwrap(),
@@ -200,7 +220,7 @@ fn rebuilds_and_mode_switches_preserve_ids_vectors_and_all_probe_results() {
         vec![vec![1.0, 0.0], vec![-1.0, 0.0]],
     )
     .unwrap();
-    let options = HybridSearchOptions::default();
+    let options = SearchOptions::default();
     let expected = data.search("fresh", &[1.0, 0.0], options).unwrap();
     let vectors: Vec<_> = (0..3)
         .map(|id| data.vectors.vector(id).unwrap().to_vec())
@@ -251,7 +271,7 @@ fn probe_changes_preserve_buffer_and_invalid_changes_leave_search_usable() {
     assert_eq!(data.vectors.vector(0).unwrap().as_ptr(), base_pointer);
     assert_eq!(data.vectors.buffered_vector_count(), 1);
     let expected = data
-        .search("fresh", &[1.0, 0.0], HybridSearchOptions::default())
+        .search("fresh", &[1.0, 0.0], SearchOptions::default())
         .unwrap();
     assert_eq!(
         data.vectors.set_mode(ivf_mode(0)),
@@ -271,7 +291,7 @@ fn probe_changes_preserve_buffer_and_invalid_changes_leave_search_usable() {
     assert_eq!(data.vectors.mode(), ivf_mode(2));
     assert_eq!(data.vectors.buffered_vector_count(), 1);
     assert_eq!(
-        data.search("fresh", &[1.0, 0.0], HybridSearchOptions::default())
+        data.search("fresh", &[1.0, 0.0], SearchOptions::default())
             .unwrap(),
         expected
     );
@@ -301,7 +321,7 @@ fn probe_changes_preserve_buffer_and_invalid_changes_leave_search_usable() {
     data.vectors.set_mode(mode).unwrap();
     assert_eq!(data.vectors.buffered_vector_count(), 0);
     assert_eq!(
-        data.search("fresh", &[1.0, 0.0], HybridSearchOptions::default())
+        data.search("fresh", &[1.0, 0.0], SearchOptions::default())
             .unwrap(),
         expected
     );
@@ -312,23 +332,23 @@ fn empty_ivf_collects_new_chunks_until_rebuild_and_validates_queries_once() {
     let mut data = CollectionData::new(2).unwrap();
     data.vectors.set_mode(ivf_mode(1)).unwrap();
     for limit in [0, 10] {
-        assert!(data.vectors.search(&[1.0, 0.0], limit).unwrap().is_empty());
+        assert!(vector_hits(&data, &[1.0, 0.0], limit).unwrap().is_empty());
         assert_eq!(
-            data.vectors.search(&[0.0, 0.0], limit),
+            vector_hits(&data, &[0.0, 0.0], limit),
             Err(VectorError::ZeroVector)
         );
         assert!(matches!(
-            data.vectors.search(&[1.0], limit),
+            vector_hits(&data, &[1.0], limit),
             Err(VectorError::DimensionMismatch { .. })
         ));
     }
     append(&mut data, "fresh", [1.0, 0.0]);
     assert_eq!(data.vectors.buffered_vector_count(), 1);
-    assert_eq!(data.vectors.search(&[1.0, 0.0], 10).unwrap()[0].doc_id, 0);
+    assert_eq!(vector_hits(&data, &[1.0, 0.0], 10).unwrap()[0].doc_id, 0);
     data.vectors.rebuild().unwrap();
     assert_eq!(data.vectors.buffered_vector_count(), 0);
     append(&mut data, "second", [-1.0, 0.0]);
-    assert_eq!(data.vectors.search(&[-1.0, 0.0], 10).unwrap()[0].doc_id, 1);
+    assert_eq!(vector_hits(&data, &[-1.0, 0.0], 10).unwrap()[0].doc_id, 1);
 }
 
 #[test]
@@ -350,6 +370,7 @@ fn batch_term_counts_match_independent_preparation() {
     let documents: Vec<_> = texts
         .iter()
         .map(|text| PreparedDocument {
+            metadata: Default::default(),
             text: text.to_string(),
             chunks: vec![PreparedChunk {
                 byte_range: 0..text.len(),
